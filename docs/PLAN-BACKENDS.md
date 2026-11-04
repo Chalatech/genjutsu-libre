@@ -1,6 +1,8 @@
-# Plan: Genjustsu con Kie (Seedance 2.5) y GPU propia, sin Enhancor ni Replicate
+# Plan: genjutsu-libre, Genjustsu con backends intercambiables (GPU propia + cualquier proveedor de video)
 
-Rama: `feat/kie-gpu-local` del fork `Chalatech/genjutsu-kie` (upstream: `sirioberati/Genjustsu-Open-Source-Workflow`, base `40fd661`).
+Rama: `feat/pluggable-backends` del fork `Chalatech/genjutsu-libre` (upstream: `sirioberati/Genjustsu-Open-Source-Workflow`, base `40fd661`).
+
+Objetivo de diseño: no casarse con ningún proveedor. La preparación corre en una GPU propia y la generación pasa por una capa de **proveedores** con la misma interfaz (`enhancor` = upstream, `kie` = primero nuevo, `openrouter` u otros después). Elegir proveedor es cambiar `GEN_BACKEND` en `.env`.
 Fecha: 2026-11-04. Este repo es **público**: nada de nombres de máquinas, IPs, usuarios u organizaciones del host GPU en commits; se le llama «GPU host» y se configura por `.env`.
 
 ## Por qué
@@ -15,9 +17,9 @@ Upstream depende de dos servicios externos:
 | Profundidad en color | Replicate `lucataco/depth-anything-video` | Video-Depth-Anything **Small** (Apache-2.0) en el GPU host, colormap inferno |
 | Máscaras | Replicate `lucataco/sam3-video` | SAM 3 (`facebook/sam3`, acceso restringido en HF) o, sin acceso, SAM 2.1 + detector de personas, en el GPU host |
 | Transporte | n/a | `rsync`/`ssh` a un alias del GPU host |
-| Generación | Enhancor Seedance 2.5 (`edit` / `multi_reference`, `pass_faces`) | Kie.ai `bytedance/seedance-2-5` (referencia multimodal, `draft: true`) y cierre HD con `bytedance/seedance-2-5-draft` |
-| Hosting de medios | tmpfiles / catbox (URLs públicas) | subida de archivos de Kie (expira en 24 h) |
-| Webhook | cloudflared obligatorio | no hace falta: Kie se consulta por polling |
+| Generación | Enhancor Seedance 2.5 (`edit` / `multi_reference`, `pass_faces`) | capa `providers/` con interfaz común; primer proveedor nuevo: Kie.ai `bytedance/seedance-2-5` (referencia multimodal, `draft: true`, cierre HD con `bytedance/seedance-2-5-draft`); `openrouter` con chequeo de capacidades |
+| Hosting de medios | tmpfiles / catbox (URLs públicas) | lo resuelve cada proveedor (Kie: su API de archivos, expira en 24 h); tmpfiles/catbox quedan para `enhancor` |
+| Webhook | cloudflared obligatorio | solo si el proveedor lo exige (Enhancor sí; Kie y OpenRouter se consultan por polling) |
 
 El comportamiento de upstream queda como **default**: los backends nuevos se activan por `.env`.
 
@@ -31,11 +33,16 @@ El comportamiento de upstream queda como **default**: los backends nuevos se act
 ## Configuración nueva (`.env`, nunca se commitea)
 
 ```
-GEN_BACKEND=enhancor        # enhancor | kie
+GEN_BACKEND=enhancor        # enhancor | kie | openrouter | (futuros)
 PREP_BACKEND=replicate      # replicate | gpu
+GEN_MAX_USD=3               # tope por request para cualquier proveedor; se rechaza por encima
+# proveedor kie
 KIE_API_KEY=
+KIE_MODEL=bytedance/seedance-2-5
 KIE_UNIT_CREDITS=17         # créditos por segundo facturable; medir y corregir en F6
-KIE_MAX_USD=3               # tope por request; se rechaza por encima
+# proveedor openrouter
+OPENROUTER_API_KEY=
+OPENROUTER_MODEL=
 GPU_HOST=                   # alias de ~/.ssh/config
 GPU_DIR=                    # carpeta de trabajo en el host (solo ahí se escribe)
 GPU_PYTHON=                 # python del venv del host
@@ -62,13 +69,14 @@ HF_TOKEN=                   # solo para SAM 3 (cuenta propia, nunca una comparti
 
 ## Reglas para todas las fases
 
-1. Solo la rama `feat/kie-gpu-local`. Nunca `main`.
+1. Solo la rama `feat/pluggable-backends`. Nunca `main`.
 2. Repo público: nunca commitear medios, caras, llaves, `.env`, `runs/`, ni datos del GPU host (nombre, IP, usuario, organización). Ejemplos y tests con datos sintéticos.
 3. Los 13 tests originales y `test_composite.py` pasan al cierre de cada fase. Cada fase agrega sus tests.
-4. **Ninguna llamada paga** (Kie `createTask`, Replicate, Enhancor) en fases desatendidas: solo mocks. Las llamadas reales son de F6, con Carlos presente y su visto bueno por cada una.
+4. **Ninguna llamada paga** (generación o subidas en Kie, OpenRouter, Enhancor; predicciones de Replicate) en fases desatendidas: solo mocks. Sí se permiten lecturas gratuitas de catálogos (p. ej. `GET` de la lista de modelos de OpenRouter). Las llamadas reales son de F6, con Carlos presente y su visto bueno por cada una.
 5. En el GPU host: solo se escribe dentro de `GPU_DIR`; sin `sudo`; sin tocar procesos ni archivos ajenos; antes de cada worker se mide la memoria libre y se aborta si es menor a `GPU_MIN_FREE_GB`; workers con `nice -n 10`, sin demonios que queden vivos. Detalles del host en las notas locales del trabajo (fuera del repo).
 6. Código y docs nuevos en inglés (igual que upstream). Commits convencionales.
 7. Video-Depth-Anything **Large** es CC-BY-NC: no se usa por defecto.
+8. Nada específico de un proveedor fuera de su módulo en `providers/`: el pipeline, la app y el CLI hablan solo con la interfaz.
 
 ## Fases
 
@@ -104,24 +112,29 @@ Archivos: `gpu_backend.py`, cambios en `pipeline.py`, `audio_workflow.py`, `raw_
 
 Aceptación: `workflow.py prepare <clip> --provider gpu` corre de punta a punta **sin** `REPLICATE_API_TOKEN` y deja `composite.mp4`, `mask.mp4`, `raw-masks/`, `audio-manifest.json`, `seedance-input` listo y fingerprint de revisión; tests con `ssh`/`rsync` simulados (líneas de comando, rechazo por memoria baja, error remoto propagado); tests viejos en verde.
 
-### F4: puente Kie
+### F4: capa de proveedores de generación (primero: Kie)
 
-Archivos: `kie_bridge.py`, despacho en `seedance_bridge.py` por `GEN_BACKEND`, `doctor.py`.
+Archivos: `providers/__init__.py` (registro y `get_provider()` por `GEN_BACKEND`), `providers/base.py`, `providers/enhancor.py` (lo de upstream movido sin cambiar comportamiento), `providers/kie.py`, `providers/openrouter.py`; `seedance_bridge.py` queda como fachada que delega; `doctor.py`.
 
-- Mismas firmas: `submit(folder, prompt, sirio, tein=None, status=print)`, `wait_and_finish(folder, request_id, status=print)`, `submit_hd(folder)`.
+- Interfaz `GenerationProvider`: `name`, `capabilities()` (video de referencia sí/no, imágenes de referencia máx., draft sí/no, resoluciones, rango de duración, si necesita webhook, si acepta caras reales: desconocido hasta medirlo), `validate(job)`, `estimate_cost(job)`, `upload(path)`, `submit(job)`, `poll(task_id)`, `download(result)`, `submit_final(draft)`. Persistencia común (`seedance-request.json`, `provider-task.json` antes de hacer polling, negativa por duplicado, sin reintentos automáticos de envíos pagos) en la fachada, no en cada proveedor.
+- Mismas firmas públicas que upstream: `submit(folder, prompt, sirio, tein=None, status=print)`, `wait_and_finish(folder, request_id, status=print)`, `submit_hd(folder)`.
+- `openrouter`: consulta gratis el catálogo de modelos y declara capacidades reales; si el modelo elegido no acepta video de referencia (al 2026-11-04 Wan 3.0 en OpenRouter solo acepta imágenes de referencia), falla con un error claro antes de subir nada. Implementar el envío solo para lo que el catálogo confirme; tests con mocks.
+
+Proveedor `kie` (el que se usará en F6):
+
 - Valida localmente las restricciones de Kie (sección de contratos) **antes** de subir nada; sube con la API de archivos de Kie.
 - Request: modelo `bytedance/seedance-2-5`, `reference_video_urls=[composite con voces]`, `reference_image_urls=[referencias]`, `draft: true`, `resolution: 480p`, `duration: -1`, `generate_audio: false`, prompt con `@Video1`/`@Image1…`.
-- Costo estimado = `KIE_UNIT_CREDITS` × (segundos de referencia + salida) × $0.005; se imprime y se rechaza si supera `KIE_MAX_USD`.
-- Escribe `seedance-request.json` y `kie-task.json` (taskId) **antes** de hacer polling; si `kie-task.json` existe, `submit` se niega (sin duplicados). Nunca reintenta un `createTask`. `fail` → error con el mensaje del proveedor.
+- Costo estimado = `KIE_UNIT_CREDITS` × (segundos de referencia + salida) × $0.005; se imprime y se rechaza si supera `GEN_MAX_USD`.
+- `provider-task.json` (taskId) se escribe **antes** de hacer polling; si existe, `submit` se niega (sin duplicados). Nunca reintenta un `createTask`. `fail` → error con el mensaje del proveedor.
 - HD: `bytedance/seedance-2-5-draft` con `draft_task_id`, resolución pedida 720p o 1080p; misma protección de duplicados en `hd/`.
-- `doctor.py`: con `GEN_BACKEND=kie` exige `KIE_API_KEY` y no exige webhook; con `PREP_BACKEND=gpu` verifica `ssh` y `check.py` remoto en vez de `REPLICATE_API_TOKEN`.
+- `doctor.py`: pregunta al proveedor activo qué necesita (llave, webhook) en vez de tener nombres fijos; con `PREP_BACKEND=gpu` verifica `ssh` y `check.py` remoto en vez de `REPLICATE_API_TOKEN`.
 
-Aceptación: tests con HTTP simulado para el cuerpo del draft y del HD, el tope de costo, la negativa por duplicado, el manejo de `fail`/`waiting` y la validación de restricciones (píxeles, fps, duración, tamaño de imagen); cero llamadas reales; tests viejos en verde.
+Aceptación: tests con HTTP simulado para la interfaz común (cualquier proveedor registrado cumple el contrato), el cuerpo del draft y del HD de Kie, el tope de costo, la negativa por duplicado, el manejo de `fail`/`waiting`, la validación de restricciones (píxeles, fps, duración, tamaño de imagen) y el rechazo claro de `openrouter` cuando el modelo no acepta video de referencia; el comportamiento de `enhancor` idéntico a upstream (sus tests viejos pasan sin cambios); cero llamadas pagas; tests viejos en verde.
 
 ### F5: UI, doctor y documentación
 
-- UI: selector de backend de preparación y de generación, hoja de instancias en la revisión de máscara con casillas por id, costo estimado antes de enviar.
-- `docs/LOCAL-GPU.md`, `docs/KIE.md`, sección «Fork notes» en el README.
+- UI: selector de backend de preparación y de proveedor de generación (lista sacada del registro de `providers/`, con sus capacidades), hoja de instancias en la revisión de máscara con casillas por id, costo estimado antes de enviar.
+- `docs/LOCAL-GPU.md`, `docs/PROVIDERS.md` (interfaz, cómo agregar un proveedor, tabla de capacidades de `enhancor`, `kie` y `openrouter`), sección «Fork notes» en el README.
 
 Aceptación: con `PREP_BACKEND=gpu`, `GEN_BACKEND=kie` y sin llaves de Enhancor ni Replicate, `doctor.py --require-keys` reporta listo; la UI responde 200 y muestra las opciones nuevas; tests en verde.
 
@@ -142,7 +155,8 @@ Re-corre tests y doctor, revisa cada criterio y las reglas en el diff (en especi
 
 ## Riesgos y preguntas abiertas
 
-- **Caras reales en Kie:** Enhancor usa `pass_faces: true`; Kie no documenta un equivalente y menciona `asset://{assetId}`. Si Kie rechaza caras reales, F6 se detiene y se evalúa la librería de assets de Kie o volver a Enhancor solo para la generación.
+- **Caras reales en Kie:** Enhancor usa `pass_faces: true`; Kie no documenta un equivalente y menciona `asset://{assetId}`. Si Kie rechaza caras reales, F6 se detiene y se evalúa la librería de assets de Kie u otro proveedor de la capa (por eso es intercambiable).
+- **OpenRouter:** al 2026-11-04 no se encontró en su catálogo un modelo de video que acepte video de referencia; el proveedor queda listo para cuando exista.
 - **Precio por variante** de Seedance 2.5 en Kie: desconocido hasta F6.
 - **Lip-sync con `generate_audio: false`:** no está confirmado que Seedance use las voces incrustadas en `@Video1` para sincronizar la boca si no genera audio.
 - **torch en el GPU host:** depende de que exista un wheel con CUDA para su arquitectura y GPU; si no, contenedor NGC (solo si el usuario ya tiene docker sin `sudo`).
