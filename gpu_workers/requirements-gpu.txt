@@ -1,0 +1,22 @@
+# Python dependencies for the GPU host workers (installed by setup_gpu.sh).
+# torch / torchvision come from the PyTorch CUDA index (see setup_gpu.sh) and are
+# pinned with a constraint so nothing below can replace them; the rest is PyPI.
+numpy<2.3
+# Voice / music separation (htdemucs). Stems are written with soundfile.
+demucs==4.0.1
+soundfile
+# Video I/O.
+opencv-python-headless
+av
+imageio
+imageio-ffmpeg
+pillow
+# Video-Depth-Anything (used from a pinned source checkout).
+einops
+easydict
+tqdm
+matplotlib
+# SAM 3 video segmentation (Sam3VideoModel lives in transformers >= 5.22).
+transformers>=5.22.1
+safetensors
+huggingface_hub
