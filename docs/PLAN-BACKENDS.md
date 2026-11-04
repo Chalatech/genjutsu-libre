@@ -23,7 +23,12 @@ Upstream depende de dos servicios externos:
 
 El comportamiento de upstream queda como **default**: los backends nuevos se activan por `.env`.
 
-## Estado de partida (medido 2026-11-04)
+## Verificado en el GPU host (2026-11-04, antes de F1)
+
+- torch 2.14.1+cu130 en un venv de Python 3.12 instalado con `uv` (lo dejó un primer intento de F1): `cuda.is_available()` = True, capability (12, 1), matmul 4096² ×10 en 0.32 s. Ya trae `opencv` 5.0, `av` 19.0.2 y `demucs` 4.0.1; falta `transformers`.
+- Alternativa probada: contenedor NGC `nvcr.io/nvidia/pytorch:25.11-py3` (torch 2.10, misma GPU, docker sin `sudo`); no trae `transformers`, `av`, `opencv` ni `demucs`.
+- SAM 3 en formato `transformers` (`model_type: sam3_video`, `Sam3VideoModel`, `model.safetensors` 3.4 GB) ya existe en disco del host: se usa por `SAM3_WEIGHTS`, sin descargar. `transformers` 5.22.1 (PyPI) incluye `models/sam3_video`. SAM 2.1 queda solo como respaldo.
+- `depth-anything/Video-Depth-Anything-Small` es público en Hugging Face (sin acceso restringido).
 
 - Setup de upstream en macOS ARM64, Python 3.15.2, Rubber Band 4.0.0: dependencias OK.
 - `test_composite.py`: PASS. `python -m unittest discover -s tests`: **13 tests OK** (todos con mocks).
@@ -48,7 +53,8 @@ GPU_DIR=                    # carpeta de trabajo en el host (solo ahí se escrib
 GPU_PYTHON=                 # python del venv del host
 GPU_MIN_FREE_GB=30          # memoria libre mínima antes de lanzar un worker
 SEGMENT_MODEL=sam3          # sam3 | sam2
-HF_TOKEN=                   # solo para SAM 3 (cuenta propia, nunca una compartida)
+SAM3_WEIGHTS=               # carpeta en el GPU host con los pesos de Sam3VideoModel (formato transformers); si está, no hace falta HF_TOKEN
+HF_TOKEN=                   # solo si hay que descargar SAM 3 (cuenta propia, nunca una compartida)
 ```
 
 ## Contratos que el código existente ya exige (no romperlos)
