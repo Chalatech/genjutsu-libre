@@ -87,18 +87,24 @@ def select(out: Path, ids: list[int]) -> dict:
 
 # ---- SAM 3 -------------------------------------------------------------------
 
-def sam3_frames(frames, prompt: str, weights: str, torch, report, chunk: int = 16):
-    """Yield (frame_idx, object_ids, masks (N, H, W) bool, scores) for every frame."""
-    import numpy as np
+def load_sam3(weights: str, torch):
+    """(model, processor) of SAM 3 on the GPU."""
     from transformers import Sam3VideoModel, Sam3VideoProcessor
 
+    try:  # straight to the GPU: no 3 GB CPU copy on a host short of memory
+        model = Sam3VideoModel.from_pretrained(weights, dtype=torch.bfloat16, device_map="cuda")
+    except (ImportError, ValueError):  # older transformers without accelerate
+        model = Sam3VideoModel.from_pretrained(weights, dtype=torch.bfloat16).to("cuda")
+    model.eval()
+    return model, Sam3VideoProcessor.from_pretrained(weights)
+
+
+def sam3_frames(frames, prompt: str, weights: str, torch, report, chunk: int = 16, args=None):
+    """Yield (frame_idx, object_ids, masks (N, H, W) bool, scores) for every frame."""
+    import numpy as np
+
     with report.stage("load"):
-        try:  # straight to the GPU: no 3 GB CPU copy on a host short of memory
-            model = Sam3VideoModel.from_pretrained(weights, dtype=torch.bfloat16, device_map="cuda")
-        except (ImportError, ValueError):  # older transformers without accelerate
-            model = Sam3VideoModel.from_pretrained(weights, dtype=torch.bfloat16).to("cuda")
-        model.eval()
-        processor = Sam3VideoProcessor.from_pretrained(weights)
+        (model, processor), report["model_cached"] = common.cached(args, f"sam3:{weights}", lambda: load_sam3(weights, torch))
     with report.stage("preprocess"):
         session = processor.init_video_session(inference_device="cuda", processing_device="cpu",
                                                video_storage_device="cpu", dtype=torch.bfloat16)
@@ -138,7 +144,7 @@ def work(args, report, torch, root):
     centers: dict[int, dict[int, float]] = {}
     seen = set()
     with report.stage("track"):
-        for frame_idx, ids, masks, frame_scores in sam3_frames(frames, args.prompt, weights, torch, report):
+        for frame_idx, ids, masks, frame_scores in sam3_frames(frames, args.prompt, weights, torch, report, args=args):
             seen.add(frame_idx)
             if len(seen) % 48 == 0:
                 print(f"[segment] tracked {len(seen)}/{total} frames, {len(areas)} objects so far", file=sys.stderr, flush=True)
@@ -306,7 +312,7 @@ def contact_sheet(frames, listing: dict, instances: Path, path: Path, columns: i
     cv2.imwrite(str(path), cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
 
 
-def main(argv: list[str] | None = None) -> int:
+def make_parser():
     parser = common.worker_parser(__doc__.splitlines()[0])
     parser.add_argument("--prompt", default="person", help="SAM 3 text prompt")
     parser.add_argument("--video", default="original.mp4", help="video inside --in to segment")
@@ -314,7 +320,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--select", help="comma-separated instance ids to merge into raw-masks/")
     parser.add_argument("--min-frames", type=int, default=8, help="drop objects present in fewer frames")
     parser.add_argument("--min-area", type=float, default=0.0005, help="drop objects with a smaller mean area (fraction of the frame)")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = make_parser().parse_args(argv)
     out = Path(args.out)
     if args.select and (out / "instances.json").is_file():
         try:  # selection only: no model, no GPU

@@ -273,8 +273,44 @@ class Report(dict):
         return path
 
 
-def run_worker(name: str, args, work) -> int:
-    """Memory guard, CUDA check, timing and report around ``work(args, report, torch)``."""
+class ModelCache:
+    """Loaded models kept between jobs by the inference server (CLI runs leave it unset)."""
+
+    def __init__(self):
+        self.items: dict = {}
+
+    def get(self, key: str, loader):
+        """Return the cached object for ``key``; the second return value tells if it was already loaded."""
+        if key in self.items:
+            return self.items[key], True
+        self.items[key] = loader()
+        return self.items[key], False
+
+    def keys(self) -> list[str]:
+        return sorted(self.items)
+
+    def clear(self, torch=None) -> list[str]:
+        """Drop every model and give GPU memory back to the host."""
+        dropped = self.keys()
+        self.items.clear()
+        import gc
+
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return dropped
+
+
+def cached(args, key: str, loader):
+    """``loader()`` result, reused across jobs when ``args.cache`` is a ModelCache (server mode)."""
+    cache = getattr(args, "cache", None)
+    if cache is None:
+        return loader(), False
+    return cache.get(key, loader)
+
+
+def execute(name: str, args, work) -> tuple[int, "Report"]:
+    """Memory guard, CUDA check, timing and report around ``work(args, report, torch, root)``."""
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     report = Report(name, out)
@@ -285,9 +321,8 @@ def run_worker(name: str, args, work) -> int:
     report.update(memory_available_gb=available, min_free_gb=need, waited_for_memory_s=waited)
     if not ok:
         report["error"] = f"only {available} GB of memory available after {waited:.0f} s, need {need} GB"
-        print(json.dumps({"worker": name, "exit": EXIT_LOW_MEMORY, "error": report["error"]}), flush=True)
         report.write()
-        return EXIT_LOW_MEMORY
+        return EXIT_LOW_MEMORY, report
     torch = None
     try:
         import torch
@@ -304,9 +339,14 @@ def run_worker(name: str, args, work) -> int:
     except Exception as exc:  # report every failure, then exit 1
         report["error"] = f"{type(exc).__name__}: {exc}"[:1000]
         code = EXIT_ERROR
-    path = report.write(torch)
+    report.write(torch)
+    return code, report
+
+
+def run_worker(name: str, args, work) -> int:
+    code, report = execute(name, args, work)
     summary = {k: report.get(k) for k in ("worker", "wall_s", "gpu_peak_gb", "rss_peak_gb", "error") if report.get(k) is not None}
-    print(json.dumps({**summary, "exit": code, "report": path.name}), flush=True)
+    print(json.dumps({**summary, "exit": code, "report": f"report-{name}.json"}), flush=True)
     return code
 
 

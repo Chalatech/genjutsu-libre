@@ -118,6 +118,19 @@ Archivos: `gpu_backend.py`, cambios en `pipeline.py`, `audio_workflow.py`, `raw_
 
 Aceptación: `workflow.py prepare <clip> --provider gpu` corre de punta a punta **sin** `REPLICATE_API_TOKEN` y deja `composite.mp4`, `mask.mp4`, `raw-masks/`, `audio-manifest.json`, `seedance-input` listo y fingerprint de revisión; tests con `ssh`/`rsync` simulados (líneas de comando, rechazo por memoria baja, error remoto propagado); tests viejos en verde.
 
+### F3b: servidor de inferencia en el GPU host (reemplaza el transporte ssh/rsync)
+
+Decisión de Carlos (2026-11-04): todo corre en la máquina local y en el GPU host **solo la inferencia**, detrás de una API. Cuando F3b esté lista, el pipeline pasa a usarla y se elimina el transporte por `rsync` de F3.
+
+Archivos: `gpu_workers/server.py` (servidor, corre en el GPU host), `gpu_api.py` (cliente, corre en la máquina local), tests. Los workers de F2 (`separate.py`, `depth.py`, `segment.py`) se reutilizan como funciones importables; sus CLI siguen funcionando.
+
+- **API estilo Replicate** (para que el código de upstream cambie lo mínimo): `POST /v1/files` (subida multipart) → `{id}`; `POST /v1/predictions` con `{"model": "separate"|"depth"|"segment", "input": {...}}` → `{id, status}`; `GET /v1/predictions/{id}` → `{status: starting|processing|succeeded|failed|canceled, output, error, metrics}`; `GET /v1/files/{id}` para bajar salidas (las máscaras de `segment` como zip con `instances/<id>/mask_00000.png…`, `instances.json` e `instances-contact.jpg`); `DELETE /v1/files/{id}`; `GET /health` (modelos cargados, memoria, cola).
+- **Sin puertos expuestos:** escucha solo en `127.0.0.1:${GPU_API_PORT}` del host; la máquina local entra por túnel ssh (`ssh -N -L <local>:127.0.0.1:<port> $GPU_HOST`). Token opcional `GPU_API_TOKEN` (cabecera `Authorization: Bearer`).
+- **Respeto por el host compartido:** carga perezosa de cada modelo en el primer pedido; descarga de los modelos y `torch.cuda.empty_cache()` tras `GPU_API_UNLOAD_IDLE_MIN` (10) minutos sin trabajo; el proceso termina solo tras `GPU_API_EXIT_IDLE_MIN` (30) minutos sin pedidos; un trabajo de GPU a la vez (cola FIFO); antes de cada trabajo, el mismo chequeo de memoria con espera de F2; `import common` antes que torch/numpy; nombre de proceso y PID en `$GPU_DIR/run/server.pid`; archivos de trabajo con vencimiento (`GPU_API_TTL_MIN`, 60) y borrado al bajar o al expirar.
+- **Cliente `gpu_api.py`:** `ensure_server()` (por ssh: si no hay servidor vivo según el PID y `/health`, lo arranca desacoplado con `nohup`/`setsid` y espera `/health`), `tunnel()` (abre y cierra el túnel), `upload()`, `predict(model, input, timeout)` con polling, `download()`. Errores claros para memoria insuficiente (que el servidor reporta como `failed` con código propio), timeout y servidor caído. Sin `rsync`.
+
+Aceptación: con el servidor arrancado por `ensure_server()` y accedido solo por el túnel, los tres modelos procesan `prueba-6s` y dan lo mismo que los CLI de F2 (mismos conteos de cuadros e instancias; profundidad con diferencia media < 1/255; máscaras idénticas o IoU ≥ 0.99); la segunda llamada a cada modelo es más rápida que la primera (se miden los tiempos de carga ahorrados); tras el tiempo de inactividad (acortado por variables en la prueba) se verifica la descarga de modelos y la salida del proceso; nada queda corriendo ni en disco del host al terminar; tests en la máquina local con servidor y modelos simulados (sin GPU) y cliente con HTTP simulado; tests viejos en verde.
+
 ### F4: capa de proveedores de generación (primero: Kie)
 
 Archivos: `providers/__init__.py` (registro y `get_provider()` por `GEN_BACKEND`), `providers/base.py`, `providers/enhancor.py` (lo de upstream movido sin cambiar comportamiento), `providers/kie.py`, `providers/openrouter.py`; `seedance_bridge.py` queda como fachada que delega; `doctor.py`.
