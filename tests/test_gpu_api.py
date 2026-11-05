@@ -90,6 +90,18 @@ class RoundTrip(ServerCase):
         self.assertEqual(ctx.exception.code, 'low_memory')
         self.assertEqual(list((self.service.api / 'jobs').iterdir()), [])
 
+    def test_finished_status_only_after_host_copies_are_gone(self):
+        seen, original = [], self.service.delete_file
+        def spy(ident):
+            if self.service.running:seen.append(self.service.predictions[self.service.running]['status'])
+            return original(ident)
+        self.service.delete_file = spy
+        self.api.predict('depth', {'video': self.api.upload(self.media)}, timeout=10)
+        low = Path(self.tmp.name) / 'low'; low.write_bytes(b'lowmem')
+        with self.assertRaises(gpu_api.GpuApiError):
+            self.api.predict('segment', {'video': self.api.upload(low)}, timeout=10)
+        self.assertEqual(seen, ['processing', 'processing'])
+
     def test_fifo_one_job_at_a_time(self):
         active, peak = [0], [0]
         def slow(model, argv, cache):
