@@ -209,3 +209,20 @@ class EnhancorUnchanged(unittest.TestCase):
         names=[c.name for c in get_provider('enhancor',env()).doctor()];self.assertEqual(names,['ENHANCOR_API_KEY','ENHANCOR_WEBHOOK_URL'])
         self.assertEqual([c.name for c in get_provider('kie',env(KIE_API_KEY='abc')).doctor() if not c.ok],[])
 if __name__=='__main__':unittest.main()
+
+
+class KieMiniTest(unittest.TestCase):
+    def test_mini_body_has_no_draft_or_output_format(self):
+        import os
+        from unittest import mock
+        from pathlib import Path
+        from providers.kie import KieProvider
+        from providers.base import Env, Job
+        with mock.patch.dict(os.environ, {'KIE_MODEL': 'bytedance/seedance-2-mini', 'KIE_API_KEY': 'k', 'SEEDANCE_EMBED_VOCALS': 'false'}):
+            kie = KieProvider(Env(setting=lambda n, d='': os.environ.get(n, d), credential=lambda n: os.environ[n]))
+            job = Job(folder=Path('.'), prompt='p', video=Path('v.mp4'), references=['a.png'])
+            body = kie.build_request(job, ['https://v', 'https://a'])
+            self.assertEqual(body['model'], 'bytedance/seedance-2-mini')
+            self.assertNotIn('draft', body['input']); self.assertNotIn('output_format', body['input'])
+            self.assertEqual(kie.capabilities().max_duration, 15)
+            self.assertFalse(kie.capabilities().draft)

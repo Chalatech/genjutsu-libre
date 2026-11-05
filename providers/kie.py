@@ -29,7 +29,15 @@ class KieProvider(GenerationProvider):
     def _model(self):
         return self.env.setting('KIE_MODEL', 'bytedance/seedance-2-5')
 
+    def _is_mini(self):
+        return self._model().endswith('seedance-2-mini')
+
     def capabilities(self):
+        if self._is_mini():
+            # Seedance 2 mini on Kie: no draft/final pass, 4-15 s, up to 3 reference videos of 2-15 s.
+            return Capabilities(reference_video=True, max_reference_images=30, draft=False, resolutions=('480p', '720p'),
+                                final_resolutions=(), min_duration=4, max_duration=15,
+                                needs_webhook=False, accepts_real_faces=None)
         return Capabilities(reference_video=True, max_reference_images=30, draft=True, resolutions=('480p',),
                             final_resolutions=('720p', '1080p'), min_duration=4, max_duration=30,
                             needs_webhook=False, accepts_real_faces=None)
@@ -151,10 +159,14 @@ class KieProvider(GenerationProvider):
         if job.mesh_mode is not None:
             desc = 'depth composite with face mesh overlay' if job.mesh_mode == 'depth_mesh' else 'original video with face mesh overlay'
             prompt = prompt.replace('colored-depth composite', desc) + ' Remove all face mesh lines and any depth colors from the output; use them only for expression and lip motion guidance. Replace the entire original identity including hair. Preserve the exact embedded dialogue and timing.'
-        return {'model': self._model(), 'input': {
+        body = {'model': self._model(), 'input': {
             'prompt': prompt, 'reference_video_urls': video_urls, 'reference_image_urls': image_urls,
             'draft': True, 'resolution': '480p', 'duration': -1, 'generate_audio': False,
             'aspect_ratio': 'adaptive', 'output_format': 'mp4'}}
+        if self._is_mini():
+            for key in ('draft', 'output_format'):      # not in the Seedance 2 mini schema
+                body['input'].pop(key, None)
+        return body
 
     def submit(self, payload, final=False):
         r = requests.post(self._api() + '/api/v1/jobs/createTask', headers=self._headers(), json=payload, timeout=90)
