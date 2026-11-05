@@ -193,7 +193,7 @@ class Service:
         inp, out = job / "in", job / "out"
         inp.mkdir(parents=True)
         out.mkdir()
-        consumed = []
+        consumed, result = [], {}
         try:
             for key, fixed in spec["files"].items():
                 entry = self.file(prediction["input"][key])
@@ -218,17 +218,18 @@ class Service:
             code, report = self.runner(prediction["model"], argv, self.cache)
             prediction["metrics"] = {k: v for k, v in report.items() if k != "started"}
             if code != 0:
-                prediction.update(status="failed", error=report.get("error") or f"worker exit {code}",
-                                  error_code=error_code(code, report.get("error")))
+                result = dict(status="failed", error=report.get("error") or f"worker exit {code}",
+                              error_code=error_code(code, report.get("error")))
                 return
-            prediction["output"] = self.collect(out)
-            prediction["status"] = "succeeded"
+            result = dict(output=self.collect(out), status="succeeded")
         except BadInput as exc:
-            prediction.update(status="failed", error=str(exc), error_code="bad_input")
+            result = dict(status="failed", error=str(exc), error_code="bad_input")
         finally:
             shutil.rmtree(job, ignore_errors=True)  # inputs may hold faces: never keep them
             for ident in consumed:
                 self.delete_file(ident)
+            # terminal status only after cleanup, so a client never sees a finished job still on disk
+            prediction.update(result)
 
     def collect(self, out: Path) -> dict:
         """Every top-level file of the worker output becomes a file id; folders are zipped."""

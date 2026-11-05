@@ -111,6 +111,7 @@ def probe(path):
 class GenerationProvider(abc.ABC):
     name = ''
     needs_media_info = False                 # True if validate() needs probed width/height/fps/duration
+    response_has_request_id = False          # True if the raw submit response already carries `requestId` (saved as is)
     poll_interval = 10
     max_polls = 360
 

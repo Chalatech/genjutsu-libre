@@ -43,7 +43,7 @@ def _write_task(folder,provider,task_id,raw,response_file):
     """Persist the task id before anything else can fail or poll. Non-upstream providers also get a
     `requestId` key so the app's and CLI's resume code keeps working."""
     folder=Path(folder)
-    saved=raw if provider.name=='enhancor' else {'requestId':task_id,**raw}
+    saved=raw if provider.response_has_request_id else {'requestId':task_id,**raw}
     (folder/response_file).write_text(json.dumps(saved))
     (folder/'provider-task.json').write_text(json.dumps({'provider':provider.name,'task_id':task_id}))
 

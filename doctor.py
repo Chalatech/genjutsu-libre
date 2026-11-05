@@ -29,7 +29,7 @@ def gpu_checks():
         with api.tunnel():health=api.health()
     except GpuApiError as exc:return [Check('GPU host',False,f'GPU host: inference server not ready ({exc.code}: {str(exc)[:120]})',fatal=True)]
     free,need=health.get('memory_available_gb'),float(setting('GPU_MIN_FREE_GB','20'))
-    loaded=', '.join(health.get('models_loaded') or []) or 'none'
+    loaded=', '.join(m.split(':',1)[0] if '/' in m else m for m in health.get('models_loaded') or []) or 'none'   # cache keys may carry host paths
     if free is not None and free<need:return [Check('GPU host memory',False,f'GPU host: server up but only {free} GB memory available (need {need:g} GB); stages will wait')]
     return [Check('GPU host',True,f'GPU host: server up through the tunnel, {free} GB memory available, models loaded: {loaded}')]
 
