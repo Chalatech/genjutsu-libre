@@ -169,3 +169,33 @@ The default `.env.example` uses `MEDIA_HOST=tmpfiles` and `MEDIA_HOST_FALLBACKS=
 The uploader checks direct URLs for HTTP errors, empty responses and HTML download pages. These checks cannot guarantee later provider access or codec compatibility. Tmpfiles references expire: for an explicitly authorized regeneration, upload fresh copies instead of reusing old request URLs. A failed upload never triggers a generation call.
 
 Paid generation requests are not automatically retried: on a timeout or unclear response, inspect the saved request/provider status first to avoid duplicate charges. On an explicit media-format failure, validate the local videos and re-upload before retrying. Polling remains the source of truth if callbacks are delayed. See [hosting details](docs/MEDIA-HOSTING.md).
+
+## Fork notes
+
+This fork keeps the upstream workflow and defaults (`GEN_BACKEND=enhancor`, `PREP_BACKEND=replicate`) and adds
+two independent, opt-in choices in `.env`:
+
+* **Generation provider** (`GEN_BACKEND`): `enhancor` (upstream), `kie` (Kie.ai Seedance 2.5, polling, no webhook,
+  no public media host) or `openrouter` (capability check only; no OpenRouter model accepts a reference video
+  yet). A provider is one file in `providers/`; the pipeline, app and CLI only use the common interface. The cloudflared webhook
+  tunnel starts only when the active provider needs one. See [docs/PROVIDERS.md](docs/PROVIDERS.md).
+* **Preparation backend** (`PREP_BACKEND=gpu`): separation, depth and SAM 3 masks run on a GPU machine you control,
+  through an inference API behind an ssh tunnel, so no Replicate token is needed. SAM 3 tracks each subject
+  separately and the review step lets you tick which ones to replace (people or objects). An optional
+  `DEPTH_SUBJECT_STRETCH=1` gives far subjects more depth relief. See [docs/LOCAL-GPU.md](docs/LOCAL-GPU.md).
+
+Example with no Enhancor or Replicate keys:
+
+```
+GEN_BACKEND=kie
+KIE_API_KEY=...
+PREP_BACKEND=gpu
+GPU_HOST=<ssh alias>
+GPU_DIR=~/genjutsu-gpu
+GPU_PYTHON=~/genjutsu-gpu/.venv/bin/python
+```
+
+`.venv/bin/python doctor.py --require-keys` checks the active provider and the GPU host without any paid call.
+In the app, the preparation backend and the generation provider can be changed per job, and the estimated cost
+is shown before anything is sent (`GEN_MAX_USD` caps every request). `.env.example` lists every variable.
+The design and phase plan are in [docs/PLAN-BACKENDS.md](docs/PLAN-BACKENDS.md).
