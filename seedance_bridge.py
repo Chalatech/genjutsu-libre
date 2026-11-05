@@ -54,7 +54,7 @@ def _cap(provider,cost,status,what='request'):
     status(f'Estimated {provider.name} cost for this {what}: ${cost:.2f} (cap ${limit:.2f})')
     if cost>limit:raise ValueError(f'Estimated cost ${cost:.2f} exceeds GEN_MAX_USD=${limit:.2f}. Nothing was uploaded or submitted.')
 
-def submit(folder,prompt,sirio,tein=None,status=print,provider_name=None):
+def submit(folder,prompt,sirio,tein=None,status=print,provider_name=None,extra_references=None):
     folder=Path(folder)
     from mask_review import require_approved, is_mesh
     require_approved(folder)
@@ -66,9 +66,11 @@ def submit(folder,prompt,sirio,tein=None,status=print,provider_name=None):
     status('Pitching isolated vocals +3 semitones and embedding in colored-depth video')
     prepared=folder/'seedance-input.mp4' if is_mesh(folder) else prepare_seedance_video(folder)
     mesh_mode=json.loads((folder/'workflow-mode.json').read_text()).get('mode') if is_mesh(folder) else None
-    job=Job(folder=folder,prompt=prompt,video=Path(prepared),references=[sirio]+([tein] if tein else []),mesh_mode=mesh_mode)
+    job=Job(folder=folder,prompt=prompt,video=Path(prepared),references=[sirio]+([tein] if tein else [])+list(extra_references or []),mesh_mode=mesh_mode)
     if provider.needs_media_info:
         job.video_info=probe(job.video);job.reference_infos=[probe(r) for r in job.references]
+    if extra_references and len(job.references)>provider.capabilities().max_reference_images:
+        raise ValueError(f'{provider.name} accepts at most {provider.capabilities().max_reference_images} reference images; got {len(job.references)}.')
     provider.validate(job)
     _cap(provider,provider.estimate_cost(job),status)
     status('Uploading video with embedded vocals and character references')
