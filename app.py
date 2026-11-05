@@ -44,7 +44,7 @@ def get(ident:str):
         raise HTTPException(404)
     return jobs[ident]
 @app.post('/jobs/{ident}/seedance')
-def seedance(ident:str,prompt:str=Form(...),sirio:UploadFile=File(...),tein:UploadFile|None=File(None)):
+def seedance(ident:str,prompt:str=Form(...),sirio:UploadFile=File(...),tein:UploadFile|None=File(None),provider:str=Form('')):
     if len(ident)!=32 or not all(c in '0123456789abcdef' for c in ident):raise HTTPException(404)
     folder=RUNS/ident
     if not (folder/'audio-manifest.json').exists():raise HTTPException(400,'Audio separation must complete first.')
@@ -61,8 +61,11 @@ def seedance(ident:str,prompt:str=Form(...),sirio:UploadFile=File(...),tein:Uplo
         path=folder/(name+suffix)
         with path.open('wb') as f:shutil.copyfileobj(upload.file,f)
         paths.append(path)
+    import providers
+    provider=provider.strip().lower()
+    if provider and provider not in providers.available():raise HTTPException(400,'Unknown generation provider')
     from seedance_bridge import submit
-    try:request_id=submit(folder,prompt,*paths)
+    try:request_id=submit(folder,prompt,*paths,provider_name=provider or None)
     except Exception as e:raise HTTPException(502,str(e))
     jobs[ident]={'id':ident,'state':'running','status':'Seedance rendering: '+request_id}
     def collect():
@@ -114,20 +117,38 @@ def create_hd(ident:str):
         if previous['state'] in ['running','done']:return previous
         if not (folder/'final-preview.mp4').exists():raise HTTPException(400,'Complete and review a draft first.')
         hd=folder/'hd';hd.mkdir(exist_ok=True)
-        hd_jobs[ident]={'state':'running','status':'Submitting approved draft for 1080p','id':ident}
+        hd_jobs[ident]={'state':'running','status':'Submitting approved draft for the final pass','id':ident}
         def save(): (hd/'status.json').write_text(json.dumps(hd_jobs[ident]))
         save()
     def work_hd():
         from seedance_bridge import submit_hd,wait_and_finish
         try:
             request_id=submit_hd(folder)
-            hd_jobs[ident].update(request_id=request_id,status='Generating 1080p through Enhancor');save()
+            hd_jobs[ident].update(request_id=request_id,status='Generating the final pass with the same provider as the draft');save()
             wait_and_finish(hd,request_id,lambda s:hd_jobs[ident].update(status=s))
             hd_jobs[ident].update(state='done',status='1080p ready · original source audio restored')
         except Exception as e:hd_jobs[ident].update(state='error',status=str(e))
         save()
     threading.Thread(target=work_hd,daemon=True).start()
     return hd_jobs[ident]
+
+@app.get('/config')
+def config_info():
+    """Defaults and options for the UI: preparation backends and the generation provider registry with capabilities."""
+    import gpu_backend,providers
+    listing=providers.describe()
+    return {'prep_default':'gpu' if gpu_backend.enabled() else 'replicate','prep_options':['gpu','replicate','huggingface','replicate-chenxwh'],
+            'gen_default':next((p['name'] for p in listing if p['active']),'enhancor'),'providers':listing}
+
+@app.get('/jobs/{ident}/estimate')
+def estimate_cost(ident:str,provider:str=''):
+    """Estimated draft/final cost for this prepared job with a provider. Free: nothing is uploaded or sent."""
+    folder=hd_folder(ident)
+    import providers
+    if provider and provider not in providers.available():raise HTTPException(400,'Unknown generation provider')
+    from seedance_bridge import estimate
+    try:return estimate(folder,provider or None)
+    except ValueError as e:raise HTTPException(409,str(e))
 
 @app.get('/jobs/{ident}/instances')
 def get_instances(ident:str):

@@ -51,11 +51,11 @@ elif a.command=='repair-rgb':
  mode=json.loads((folder/'workflow-mode.json').read_text()).get('mode') if (folder/'workflow-mode.json').exists() else 'depth'
  if mode=='face_mesh':p.error('Fast face mesh has no SAM mask. Reprepare facial tracking instead.')
  from raw_masks import segment_raw,clean_border_fragments
- from pipeline import composite
+ from pipeline import composite,stretch_regions
  from audio_workflow import prepare_seedance_video
  meta=json.loads((folder/'manifest.json').read_text());repair=folder/'rgb-repair';repair.mkdir(exist_ok=True)
  masks=clean_border_fragments(segment_raw(folder/'original.mp4',repair,meta.get('prompt','person'),meta.get('depth_provider'),meta.get('instances')))
- composite(folder/'original.mp4',folder/'depth.mp4',masks,folder,folder/'upload.mp4')
+ composite(folder/'original.mp4',folder/'depth.mp4',masks,folder,folder/'upload.mp4',stretch_regions(repair))
  if mode=='depth_mesh':
   import shutil,subprocess
   shutil.copy2(folder/'composite-silent.mp4',folder/'depth-composite-silent.mp4')

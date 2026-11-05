@@ -46,7 +46,8 @@ def reselect(folder,ids,status=print):
     selected=json.loads((folder/'instance-selection.json').read_text())['ids']
     raw_dir=clean_border_fragments(folder/'raw-masks')
     status('Compositing · depth subject over original background')
-    composite(folder/'original.mp4',folder/'depth.mp4',raw_dir,folder,folder/'upload.mp4')
+    from pipeline import stretch_regions
+    composite(folder/'original.mp4',folder/'depth.mp4',raw_dir,folder,folder/'upload.mp4',stretch_regions(folder))
     status('Embedding isolated vocals · +3 semitones');prepare_seedance_video(folder)
     (folder/'mask-review.json').unlink(missing_ok=True)
     manifest=folder/'manifest.json'

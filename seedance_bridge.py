@@ -23,10 +23,21 @@ def _task(folder):
     try:return json.loads((Path(folder)/'provider-task.json').read_text())
     except (OSError,ValueError):return None
 
-def _provider_for(folder):
-    """The provider that created this job (so resuming never switches service); else GEN_BACKEND."""
+def _provider_for(folder,name=None):
+    """The provider that created this job (so resuming never switches service); else `name`, else GEN_BACKEND."""
     folder=Path(folder);saved=_task(folder) or (_task(folder.parent) if folder.name=='hd' else None)
-    return get_provider((saved or {}).get('provider') or config.setting('GEN_BACKEND','enhancor') or 'enhancor',_env())
+    return get_provider((saved or {}).get('provider') or name or config.setting('GEN_BACKEND','enhancor') or 'enhancor',_env())
+
+def estimate(folder,name=None):
+    """What a draft (and its HD pass) would cost with this provider for the prepared input, before anything is sent.
+    Reference images are assumed (a character reference video would add its seconds). Free: no upload, no request."""
+    folder=Path(folder);prepared=folder/'seedance-input.mp4'
+    if not prepared.exists():raise ValueError('Prepare the video first.')
+    provider=_provider_for(folder,name);job=Job(folder=folder,prompt='',video=prepared,video_info=probe(prepared))
+    try:limit=float(setting('GEN_MAX_USD','3') or 3)
+    except ValueError:limit=3.0
+    draft=provider.estimate_cost(job);final=provider.estimate_final_cost(job.seconds)
+    return {'provider':provider.name,'seconds':round(job.seconds,2),'draft_usd':None if draft is None else round(draft,2),'final_usd':None if final is None else round(final,2),'cap_usd':limit,'over_cap':draft is not None and draft>limit}
 
 def _write_task(folder,provider,task_id,raw,response_file):
     """Persist the task id before anything else can fail or poll. Non-upstream providers also get a
@@ -43,12 +54,12 @@ def _cap(provider,cost,status,what='request'):
     status(f'Estimated {provider.name} cost for this {what}: ${cost:.2f} (cap ${limit:.2f})')
     if cost>limit:raise ValueError(f'Estimated cost ${cost:.2f} exceeds GEN_MAX_USD=${limit:.2f}. Nothing was uploaded or submitted.')
 
-def submit(folder,prompt,sirio,tein=None,status=print):
+def submit(folder,prompt,sirio,tein=None,status=print,provider_name=None):
     folder=Path(folder)
     from mask_review import require_approved, is_mesh
     require_approved(folder)
     if (folder/'seedance-response.json').exists() or (folder/'provider-task.json').exists():raise ValueError('This job already has a provider response. Resume it; prepare a new job for a deliberate variation.')
-    provider=_provider_for(folder)
+    provider=_provider_for(folder,provider_name)
     provider.preflight()
     if not (folder/'audio-manifest.json').exists():raise ValueError('Audio separation must complete before submission.')
     from audio_workflow import prepare_seedance_video

@@ -12,6 +12,7 @@ GPU_API_EXIT_IDLE_MIN / GPU_API_TTL_MIN. See ``gpu_api.py`` for the client itsel
 """
 from __future__ import annotations
 
+import re
 import contextlib
 import json
 import shutil
@@ -45,7 +46,18 @@ def enabled(provider=None):
     return provider == 'gpu'
 
 
+_NOISE = re.compile(r'^\s*$|^\[transformers\]|warn|deprecat|^traceback|^\s+File |^\s+\^|FutureWarning|UserWarning', re.I)
+
+
+def clean_status(text, limit=300):
+    """Worker output for the user-facing status: drop library warnings and traceback frames, keep the last real line."""
+    raw = [l.strip() for l in str(text or '').splitlines() if l.strip()]
+    lines = [l for l in raw if not _NOISE.search(l)]
+    return (lines or raw or [''])[-1][:limit]
+
+
 def translate(error: GpuApiError, what: str) -> GpuError:
+    error = GpuApiError(error.code, clean_status(error.message))
     if error.code == 'low_memory':return GpuMemoryError(f'{what}: the GPU host ran out of free memory ({error})')
     if error.code in ('server_down', 'unauthorized'):return GpuUnreachable(f'{what}: {error}')
     if error.code == 'timeout':return GpuError(f'{what}: timed out ({error})')
@@ -79,7 +91,7 @@ class Gpu:
         try:
             file_id = self.api.upload(Path(source), upload_name)
             output = self.api.predict(model, {key: file_id, **(data or {})}, timeout=self.timeout(model),
-                                      on_status=lambda s: self.status(f'GPU host · {model} {s}'))
+                                      on_status=lambda s: self.status(f'GPU host · {model} {clean_status(s)}'))
             file_id = None   # consumed by the job
             self.api.download_all(output, out)
             output = {}

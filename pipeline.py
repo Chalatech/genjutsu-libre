@@ -87,13 +87,19 @@ def grayscale(src,dst,inferno=False):
     if out is None:raise ValueError('Empty depth video')
     finish(out,s)
 
-def composite(original,depth,seg,directory,audio_source=None):
+def composite(original,depth,seg,directory,audio_source=None,stretch=None):
+    """`stretch`: None (off), True (stretch the whole mask as one subject) or a list of per-subject mask folders; see depth_stretch.py."""
     raw=Path(seg).is_dir()
     mask_files=sorted(Path(seg).glob('mask_*.png')) if raw else []
     counts=[sum(1 for _ in frames(p)) for p in [original,depth]]+[len(mask_files) if raw else sum(1 for _ in frames(seg))]
     if len(set(counts))!=1:raise ValueError(f'Frame alignment failed (original/depth/SAM): {counts}. No misaligned export produced.')
     if raw and [int(p.stem.split('_')[-1]) for p in mask_files]!=list(range(counts[0])):raise ValueError('Missing or shifted frame indices in raw masks.')
     outs={};area=0
+    stretcher=None
+    if stretch:
+        from depth_stretch import SubjectStretch
+        if not raw:raise ValueError('DEPTH_SUBJECT_STRETCH needs raw PNG masks.')
+        stretcher=SubjectStretch(depth,[seg] if stretch is True else stretch)
     for i,(rgb,d,sam) in enumerate(zip(frames(original),frames(depth),(np.asarray(Image.open(p).convert('RGB')) for p in mask_files) if raw else frames(seg))):
         h,w=rgb.shape[:2]
         if raw:
@@ -108,6 +114,7 @@ def composite(original,depth,seg,directory,audio_source=None):
             mask=((marked_error+100<unchanged_error)&(observed[:,:,1]-base[:,:,1]>12)).astype(np.uint8)*255
         mask=np.asarray(Image.fromarray(mask).resize((w,h),Image.Resampling.NEAREST));area+=np.count_nonzero(mask)
         d=np.asarray(Image.fromarray(d).resize((w,h),Image.Resampling.BILINEAR));alpha=(mask>127)[:,:,None]
+        if stretcher:d=stretcher.apply(i,d,mask>127)
         result=np.where(alpha,d,rgb).astype(np.uint8)
         for name,a in [('mask',np.repeat(mask[:,:,None],3,axis=2)),('composite-silent',result)]:
             if name not in outs:outs[name]=writer(directory/(name+'.mp4'),w,h)
@@ -124,6 +131,15 @@ def composite(original,depth,seg,directory,audio_source=None):
             for packet in aud.demux(audio=0):
                 if packet.dts is not None:packet.stream=astream;output.mux(packet)
     return counts[0]
+
+def stretch_regions(directory,per_instance=True):
+    """None when DEPTH_SUBJECT_STRETCH is off; else the mask folders to stretch (selected instances, or the whole mask)."""
+    from depth_stretch import enabled
+    if not enabled():return None
+    selection=Path(directory)/'instance-selection.json'
+    if per_instance and selection.exists():
+        return [Path(directory)/'instances'/str(i) for i in json.loads(selection.read_text())['ids']]
+    return True
 
 def run(src,directory,prompt='person',provider='replicate',status=print,instances=None):
     import gpu_backend
@@ -147,7 +163,7 @@ def _run(src,directory,prompt='person',provider='replicate',status=print,instanc
     from raw_masks import segment_raw,clean_border_fragments
     raw_dir=clean_border_fragments(segment_raw(directory/('original.mp4' if gpu else 'depth.mp4'),directory,prompt,provider,instances,status))
     status('Compositing · depth subject over original background')
-    composite(directory/'original.mp4',directory/'depth.mp4',raw_dir,directory,src)
+    composite(directory/'original.mp4',directory/'depth.mp4',raw_dir,directory,src,stretch_regions(directory,gpu))
     from audio_workflow import prepare_seedance_video
     status('Embedding isolated vocals · +3 semitones')
     prepare_seedance_video(directory)

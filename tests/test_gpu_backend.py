@@ -233,5 +233,20 @@ class Doctor(unittest.TestCase):
             self.assertEqual([c.name for c in doctor.prep_checks()], [])
 
 
+class CleanStatus(unittest.TestCase):
+    def test_drops_library_warnings_and_keeps_the_last_real_line(self):
+        import gpu_backend
+        text='[transformers] The `use_cache` argument is deprecated\nUserWarning: something\nsegment: 45% of frames tracked\n[transformers] noisy again'
+        self.assertEqual(gpu_backend.clean_status(text),'segment: 45% of frames tracked')
+    def test_all_noise_still_returns_something_short(self):
+        import gpu_backend
+        self.assertEqual(gpu_backend.clean_status('[transformers] only a warning'),'[transformers] only a warning')
+        self.assertLessEqual(len(gpu_backend.clean_status('x'*1000)),300)
+    def test_translate_cleans_error_text(self):
+        import gpu_backend
+        e=gpu_backend.translate(GpuApiError('worker_error','[transformers] warn\nCUDA failed: bad thing'),'depth')
+        self.assertIn('CUDA failed: bad thing',str(e));self.assertNotIn('[transformers]',str(e))
+
+
 if __name__ == '__main__':
     unittest.main()

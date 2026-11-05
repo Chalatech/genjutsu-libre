@@ -1,15 +1,21 @@
-"""OpenRouter: capabilities come from its free public model catalog, never from assumption.
+"""OpenRouter: capabilities are declared per configured model (`OPENROUTER_MODEL`), never assumed.
 
-This workflow needs a model that takes a REFERENCE VIDEO and returns a video. At 2026-11-04 the catalog lists
-no video-output model at all (Wan 3.0 on OpenRouter accepts reference images only), so every run stops with a
-clear error before anything is uploaded. Submission is implemented only for what the catalog confirms:
-nothing yet, so `submit` refuses. If the catalog is unreachable the provider assumes "video reference not
-supported" and says so.
+This workflow needs a model that takes a REFERENCE VIDEO and returns a video. The free public catalog
+(`/api/v1/models`) does NOT list video models at all, so an absent entry proves nothing. Capabilities come
+from, in order: the catalog when it does list the model, then KNOWN_MODELS below (read from the model's
+public page), otherwise "unknown" which is treated as unsupported. At 2026-11-04 OpenRouter's Wan 3.0 accepts
+reference IMAGES only, so every run stops with a clear error before anything is uploaded. Submission is
+implemented only for what is confirmed to work: nothing yet, so `submit` refuses.
 """
 import requests
 from .base import GenerationProvider, Capabilities, PollResult, Unsupported, Check
 
 CATALOG = 'https://openrouter.ai/api/v1/models'
+
+# Models the catalog does not list, as read from their public pages. Add a row when one is verified.
+KNOWN_MODELS = {
+    'alibaba/wan-3.0': {'reference_video': False, 'reference_images': True, 'checked': '2026-11-04'},
+}
 
 
 class OpenRouterProvider(GenerationProvider):
@@ -33,15 +39,24 @@ class OpenRouterProvider(GenerationProvider):
     def _model_id(self):
         return self.env.setting('OPENROUTER_MODEL', '').strip()
 
-    def capabilities(self):
-        models, error = self._models()
+    def _declared(self):
+        """('catalog'|'table'|None, reference_video, reference_images) for the configured model."""
+        if not self._model_id():
+            return None, False, False
+        models, _ = self._models()
         m = models.get(self._model_id())
-        arch = (m or {}).get('architecture') or {}
-        takes_video = 'video' in (arch.get('input_modalities') or [])
-        makes_video = 'video' in (arch.get('output_modalities') or [])
-        takes_images = 'image' in (arch.get('input_modalities') or [])
-        return Capabilities(reference_video=bool(m and takes_video and makes_video),
-                            max_reference_images=30 if (m and makes_video and takes_images) else 0,
+        if m:
+            arch = m.get('architecture') or {}
+            takes, makes = arch.get('input_modalities') or [], arch.get('output_modalities') or []
+            return 'catalog', 'video' in takes and 'video' in makes, 'video' in makes and 'image' in takes
+        known = KNOWN_MODELS.get(self._model_id())
+        if known:
+            return 'table', known['reference_video'], known['reference_images']
+        return None, False, False
+
+    def capabilities(self):
+        _, video, images = self._declared()
+        return Capabilities(reference_video=video, max_reference_images=1 if images else 0,   # exact image limit not verified
                             draft=False, resolutions=(), final_resolutions=(), needs_webhook=False,
                             accepts_real_faces=None)
 
@@ -50,10 +65,12 @@ class OpenRouterProvider(GenerationProvider):
         model = self._model_id()
         if not model:
             return 'Set OPENROUTER_MODEL in .env.'
-        if error:
-            return f'OpenRouter {error}; assuming video reference is not supported.'
-        if model not in models:
-            return f'Model {model!r} is not in the OpenRouter catalog.'
+        source, _, _ = self._declared()
+        if source == 'table':
+            return f'Model {model!r} accepts reference images only, not a reference video (checked {KNOWN_MODELS[model]["checked"]}).'
+        if source is None:
+            extra = f' ({error}; the catalog does not list video models anyway)' if error else ' (the public catalog does not list video models)'
+            return f'Model {model!r} is not in the OpenRouter catalog or in this provider\'s table of known video models{extra}; assuming video reference is not supported.'
         return f'Model {model!r} does not accept a reference video and return a video.'
 
     def preflight(self):

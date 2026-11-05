@@ -32,3 +32,23 @@ def get_provider(name=None, env=None):
         raise ValueError(f'Unknown GEN_BACKEND {name!r}. Available: {", ".join(available())}.')
     module, cls = _REGISTRY[name]
     return getattr(import_module(module), cls)(env)
+
+
+def describe(env=None):
+    """Registry listing for UIs: one dict per provider with its capabilities and whether its local checks pass.
+    Free and offline apart from OpenRouter's public catalog read; never calls a paid endpoint."""
+    from dataclasses import asdict
+    env = env or default_env()
+    active = (env.setting('GEN_BACKEND', 'enhancor') or 'enhancor').strip().lower()
+    out = []
+    for name in available():
+        entry = {'name': name, 'active': name == active}
+        try:
+            provider = get_provider(name, env)
+            checks = provider.doctor()
+            entry.update(capabilities=asdict(provider.capabilities()), ready=all(c.ok for c in checks),
+                         problems=[c.message for c in checks if not c.ok])
+        except Exception as exc:   # a broken provider must not hide the others
+            entry.update(capabilities=None, ready=False, problems=[f'{type(exc).__name__}: {str(exc)[:160]}'])
+        out.append(entry)
+    return out

@@ -213,8 +213,15 @@ class OpenRouter(unittest.TestCase):
         return OpenRouterProvider(env(OPENROUTER_MODEL=model,OPENROUTER_API_KEY='k'))
     def test_image_only_video_model_is_refused_before_anything(self):
         p=self.provider('wan/wan-3.0')
-        self.assertFalse(p.capabilities().reference_video);self.assertEqual(p.capabilities().max_reference_images,30)
+        self.assertFalse(p.capabilities().reference_video);self.assertEqual(p.capabilities().max_reference_images,1)
         with self.assertRaisesRegex(Unsupported,'does not accept a reference video'):p.preflight()
+    def test_known_model_missing_from_catalog_uses_the_table(self):
+        p=self.provider('alibaba/wan-3.0',catalog={'data':[]})
+        caps=p.capabilities();self.assertFalse(caps.reference_video);self.assertEqual(caps.max_reference_images,1)
+        with self.assertRaisesRegex(Unsupported,'reference images only'):p.preflight()
+        import requests
+        q=self.provider('alibaba/wan-3.0',error=requests.ConnectionError())   # table works without the network
+        with self.assertRaisesRegex(Unsupported,'reference images only'):q.preflight()
     def test_text_model_is_refused(self):
         with self.assertRaises(Unsupported):self.provider('acme/text-only').preflight()
     def test_unknown_model_and_missing_model(self):
