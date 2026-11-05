@@ -128,15 +128,25 @@ class KieProvider(GenerationProvider):
         video_urls = [urls[0]] + [u for ref, u in zip(refs, urls[1:]) if Path(ref).suffix.lower() in VIDEO_SUFFIXES]
         image_urls = [u for ref, u in zip(refs, urls[1:]) if Path(ref).suffix.lower() in IMAGE_SUFFIXES]
         from audio_workflow import embed_vocals
-        notes = ['@Video1 is the source edit: a colored-depth composite with isolated vocals pitched +3 semitones embedded; use its embedded audio for performance and lip synchronization.'
-                 if embed_vocals() else '@Video1 is the source edit: a silent colored-depth composite; follow its motion and timing.']
+        from config import setting
+        if not embed_vocals():
+            first = '@Video1 is the source edit: a silent colored-depth composite; follow its motion and timing.'
+        elif str(setting('SEEDANCE_GUIDE_AUDIO', '') or '').strip():
+            first = '@Video1 is the source edit: a colored-depth composite with the performer\'s guide vocal embedded; use its embedded audio for lip synchronization.'
+        else:
+            first = '@Video1 is the source edit: a colored-depth composite with isolated vocals pitched +3 semitones embedded; use its embedded audio for performance and lip synchronization.'
+        notes = [first]
         n_video = 1
         for ref in refs:
             if Path(ref).suffix.lower() in VIDEO_SUFFIXES:
                 n_video += 1
                 notes.append(f'@Video{n_video} is only a character visual identity reference.')
-        for i in range(len(image_urls)):
-            notes.append(f'@Image{i + 1} is the {"primary" if i == 0 else "secondary"} character reference.' if len(image_urls) > 1 else '@Image1 is the only replacement character reference.')
+        if len(image_urls) > 2:
+            # Many references (characters, props, a location): the prompt says what each one is.
+            notes.append(f'@Image1 to @Image{len(image_urls)} are the reference images described in the prompt.')
+        else:
+            for i in range(len(image_urls)):
+                notes.append(f'@Image{i + 1} is the {"primary" if i == 0 else "secondary"} character reference.' if len(image_urls) > 1 else '@Image1 is the only replacement character reference.')
         prompt = job.prompt.replace('@Audio1', 'the audio embedded in @Video1') + '\n' + ' '.join(notes)
         if job.mesh_mode is not None:
             desc = 'depth composite with face mesh overlay' if job.mesh_mode == 'depth_mesh' else 'original video with face mesh overlay'
