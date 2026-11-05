@@ -99,10 +99,13 @@ def work(args, report, torch, root):
         elif src.resolve() != target.resolve():
             write_audio(target, original)
     report["seconds"] = round(original.shape[1] / RATE, 2)
-    with report.stage("load"):
+    def load():
         with torch.device("cuda"), common.skip_weight_init(torch):  # weights go straight to the GPU
-            model = get_model(args.model)
-        model.to("cuda").eval()
+            loaded = get_model(args.model)
+        return loaded.to("cuda").eval()
+
+    with report.stage("load"):
+        model, report["model_cached"] = common.cached(args, f"demucs:{args.model}", load)
     if model.samplerate != RATE or model.audio_channels != 2:
         raise RuntimeError(f"unexpected model format {model.samplerate} Hz x {model.audio_channels}")
     with report.stage("separate"):
@@ -123,12 +126,16 @@ def work(args, report, torch, root):
                   vocals_rms=round(float((stems["vocals"] ** 2).mean() ** 0.5), 4))
 
 
-def main(argv: list[str] | None = None) -> int:
+def make_parser():
     parser = common.worker_parser(__doc__.splitlines()[0])
     parser.add_argument("--job-id", help="id recorded as prediction_id (default: name of the job folder)")
     parser.add_argument("--model", default="htdemucs")
     parser.add_argument("--shifts", type=int, default=1, help="random shifts averaged by demucs (more = slower, slightly better)")
-    return common.run_worker("separate", parser.parse_args(argv), work)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    return common.run_worker("separate", make_parser().parse_args(argv), work)
 
 
 if __name__ == "__main__":

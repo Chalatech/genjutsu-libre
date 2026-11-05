@@ -79,19 +79,22 @@ def work(args, report, torch, root):
     with report.stage("read"):
         frames = np.stack(common.read_frames(src))
     report.update(frames_in=int(frames.shape[0]), size=[int(frames.shape[2]), int(frames.shape[1])])
-    with report.stage("load"):
+    def load():
         sys.path.insert(0, str(vda_root))
         from video_depth_anything.video_depth import VideoDepthAnything
 
         report["fused_attention"] = args.attention == "fused" and use_fused_attention(torch)
 
         with common.skip_weight_init(torch):
-            model = VideoDepthAnything(**VDA_SMALL)
-        model.load_state_dict(torch.load(weights, map_location="cpu"), strict=True)
-        model = model.to("cuda").eval()
+            loaded = VideoDepthAnything(**VDA_SMALL)
+        loaded.load_state_dict(torch.load(weights, map_location="cpu"), strict=True)
+        return loaded.to("cuda").eval()
+
+    with report.stage("load"):
+        model, report["model_cached"] = common.cached(args, f"vda-small:{args.attention}", load)
     with report.stage("infer"):
         depths, _ = model.infer_video_depth(frames, 24, input_size=args.input_size, device="cuda", fp32=args.fp32)
-    del frames, model
+    del frames
     torch.cuda.empty_cache()
     with report.stage("write"):
         written = common.write_video(out, colorize(depths))
@@ -104,13 +107,17 @@ def work(args, report, torch, root):
         raise RuntimeError("depth is constant over the whole clip")
 
 
-def main(argv: list[str] | None = None) -> int:
+def make_parser():
     parser = common.worker_parser(__doc__.splitlines()[0])
     parser.add_argument("--input-size", type=int, default=518, help="model input size (multiple of 14)")
     parser.add_argument("--fp32", action="store_true", help="full precision (slower; default uses autocast)")
     parser.add_argument("--attention", choices=["fused", "upstream"], default="fused",
                         help="fused: torch scaled_dot_product_attention (low memory); upstream: the original code")
-    return common.run_worker("depth", parser.parse_args(argv), work)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    return common.run_worker("depth", make_parser().parse_args(argv), work)
 
 
 if __name__ == "__main__":
