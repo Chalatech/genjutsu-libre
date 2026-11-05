@@ -105,11 +105,24 @@ def prepare_seedance_video(folder, semitones=3):
         data.update(seedance_video='seedance-input.mp4',seedance_audio=None,pitch_semitones=None,embedded_vocals=None)
         manifest.write_text(json.dumps(data,indent=2))
         return target
-    binary=shutil.which('rubberband')
-    if not binary:raise RuntimeError('Rubber Band is required for pitch shifting.')
-    pitched=folder/f'vocals-plus{semitones}.wav'
-    subprocess.run([binary,'--fine','--pitch',str(semitones),'--time','1',str(folder/'vocals.wav'),str(pitched)],check=True,capture_output=True)
-    original=read_audio(folder/'vocals.wav');samples=read_audio(pitched)
+    from config import setting
+    guide=str(setting('SEEDANCE_GUIDE_AUDIO','') or '').strip()
+    source=folder/'vocals.wav'
+    if guide:
+        # A performer's own guide track (e.g. the user re-recording the lines), time-aligned to the clip.
+        path=Path(guide).expanduser()
+        if not path.exists():raise ValueError(f'SEEDANCE_GUIDE_AUDIO not found: {path}')
+        source=folder/'guide.wav';write_audio(source,read_audio(path))
+        semitones=int(setting('SEEDANCE_GUIDE_SEMITONES','0') or 0)
+    pitched=folder/(f'{source.stem}-plus{semitones}.wav')
+    if semitones:
+        binary=shutil.which('rubberband')
+        if not binary:raise RuntimeError('Rubber Band is required for pitch shifting.')
+        subprocess.run([binary,'--fine','--pitch',str(semitones),'--time','1',str(source),str(pitched)],check=True,capture_output=True)
+    else:
+        write_audio(pitched,read_audio(source))
+    length_ref=folder/'vocals.wav' if (folder/'vocals.wav').exists() else source
+    original=read_audio(length_ref);samples=read_audio(pitched)
     n=original.shape[1]
     samples=np.pad(samples,((0,0),(0,max(0,n-samples.shape[1]))))[:,:n]
     write_audio(pitched,samples)
@@ -124,6 +137,6 @@ def prepare_seedance_video(folder, semitones=3):
         for packet in audio.encode():out.mux(packet)
     manifest=folder/'audio-manifest.json'
     data=json.loads(manifest.read_text()) if manifest.exists() else {}
-    data.update(seedance_video='seedance-input.mp4',seedance_audio=None,pitch_semitones=semitones,embedded_vocals=f'vocals-plus{semitones}.wav',final_audio='entire original source audio')
+    data.update(seedance_video='seedance-input.mp4',seedance_audio=None,pitch_semitones=semitones,embedded_vocals=pitched.name,guide_track=bool(guide),final_audio='entire original source audio')
     manifest.write_text(json.dumps(data,indent=2))
     return target

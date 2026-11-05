@@ -95,6 +95,9 @@ def composite(original,depth,seg,directory,audio_source=None,stretch=None):
     if len(set(counts))!=1:raise ValueError(f'Frame alignment failed (original/depth/SAM): {counts}. No misaligned export produced.')
     if raw and [int(p.stem.split('_')[-1]) for p in mask_files]!=list(range(counts[0])):raise ValueError('Missing or shifted frame indices in raw masks.')
     outs={};area=0
+    from config import setting
+    background=str(setting('COMPOSITE_BACKGROUND','original') or 'original').strip().lower()
+    if background not in ('original','plain','depth'):raise ValueError('COMPOSITE_BACKGROUND must be original, plain or depth.')
     stretcher=None
     if stretch:
         from depth_stretch import SubjectStretch
@@ -115,6 +118,8 @@ def composite(original,depth,seg,directory,audio_source=None,stretch=None):
         mask=np.asarray(Image.fromarray(mask).resize((w,h),Image.Resampling.NEAREST));area+=np.count_nonzero(mask)
         d=np.asarray(Image.fromarray(d).resize((w,h),Image.Resampling.BILINEAR));alpha=(mask>127)[:,:,None]
         if stretcher:d=stretcher.apply(i,d,mask>127)
+        if background=='plain':rgb=np.full_like(rgb,128)          # neutral grey: no source pixels outside the subjects
+        elif background=='depth':rgb=d                            # whole-frame depth: geometry and camera motion, no textures
         result=np.where(alpha,d,rgb).astype(np.uint8)
         for name,a in [('mask',np.repeat(mask[:,:,None],3,axis=2)),('composite-silent',result)]:
             if name not in outs:outs[name]=writer(directory/(name+'.mp4'),w,h)
