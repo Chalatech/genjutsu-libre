@@ -6,6 +6,7 @@ from .base import (GenerationProvider, Capabilities, PollResult, SubmissionRejec
 
 class EnhancorProvider(GenerationProvider):
     name = 'enhancor'
+    response_has_request_id = True   # the app and CLI resume from its raw `requestId`
 
     def _base(self):
         return self.env.setting('ENHANCOR_BASE_URL', 'https://apireq.enhancor.ai/api/seedance2.5/v1').rstrip('/') + '/'
