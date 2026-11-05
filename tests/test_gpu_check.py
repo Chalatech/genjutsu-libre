@@ -18,7 +18,7 @@ def fake_torch(cuda=True, capability=(12, 1), arch_list=('sm_80', 'sm_90', 'sm_1
 def run_main(torch_module, available=64.0, argv=()):
     out = io.StringIO()
     with patch.dict(sys.modules, {'torch': torch_module}), patch.object(check, 'free_memory_gb', return_value=available), \
-            patch.object(check, 'matmul_ms', return_value=(7.0, True)) as matmul, patch.dict(os.environ, {'GPU_MIN_FREE_GB': '30'}), \
+            patch.object(check, 'matmul_ms', return_value=(7.0, True)) as matmul, patch.dict(os.environ, {'GPU_MIN_FREE_GB': '30', 'GPU_MEM_WAIT_MIN': '0'}), \
             redirect_stdout(out):
         code = check.main(list(argv))
     return code, json.loads(out.getvalue()), matmul
@@ -63,6 +63,21 @@ class MainTests(unittest.TestCase):
     def test_exits_3_and_skips_gpu_work_when_memory_is_low(self):
         code, report, matmul = run_main(fake_torch(), available=12.5)
         self.assertEqual(code, 3); self.assertIn('12.5', report['error']); matmul.assert_not_called()
+
+    def test_default_minimum_is_20_gb(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('GPU_MIN_FREE_GB', None)
+            self.assertEqual(check.min_free_gb(), 20.0)
+
+    def test_waits_for_memory_before_giving_up(self):
+        readings = iter([12.0, 15.0, 24.0])
+        out = io.StringIO()
+        with patch.dict(sys.modules, {'torch': fake_torch()}), patch.object(check, 'free_memory_gb', side_effect=lambda: next(readings)), \
+                patch.object(check, 'matmul_ms', return_value=(7.0, True)), patch('time.sleep'), \
+                patch.dict(os.environ, {'GPU_MIN_FREE_GB': '20', 'GPU_MEM_WAIT_MIN': '30', 'GPU_MEM_POLL_S': '0'}), redirect_stdout(out):
+            code = check.main([])
+        report = json.loads(out.getvalue())
+        self.assertEqual((code, report['memory_available_gb']), (0, 24.0))
 
     def test_exits_1_when_build_has_no_kernels_for_the_gpu(self):
         code, report, _ = run_main(fake_torch(arch_list=('sm_80', 'sm_90')))

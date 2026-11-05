@@ -5,7 +5,8 @@ Prints a JSON report: torch version, CUDA availability, GPU name and capability,
 the time of a 4096x4096 matmul, the free system memory and which worker
 components are installed. Exit codes: 0 ok, 1 no usable CUDA (torch missing, no
 GPU, no kernels for the GPU's capability, failed matmul), 3 not enough free
-memory to start (GPU_MIN_FREE_GB, default 30).
+memory to start (GPU_MIN_FREE_GB, default 20, re-checked every GPU_MEM_POLL_S
+seconds for up to GPU_MEM_WAIT_MIN minutes, like the workers).
 
     python check.py                # environment + matmul
     python check.py --load-models  # also load SAM 3 and Video-Depth-Anything Small on the GPU
@@ -22,23 +23,11 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from common import free_memory_gb, gpu_dir, min_free_gb, wait_for_memory  # noqa: E402
+
 VDA_SMALL = {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]}
-
-
-def gpu_dir() -> Path:
-    value = os.getenv("GPU_DIR")
-    return Path(value).expanduser() if value else HERE.parent
-
-
-def free_memory_gb(meminfo: str = "/proc/meminfo") -> float | None:
-    try:
-        with open(meminfo) as handle:
-            for line in handle:
-                if line.startswith("MemAvailable:"):
-                    return round(int(line.split()[1]) / 1024 / 1024, 1)
-    except (OSError, ValueError, IndexError):
-        pass
-    return None
 
 
 def _arch_number(item: str) -> int | None:
@@ -154,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--load-models", action="store_true", help="also load SAM 3 and VDA Small on the GPU")
     args = parser.parse_args(argv)
     root = gpu_dir()
-    min_free = float(os.getenv("GPU_MIN_FREE_GB", "30"))
+    min_free = min_free_gb()
     report: dict = {"memory_available_gb": free_memory_gb(), "min_free_gb": min_free, "components": components(root)}
 
     def done(code: int, error: str | None = None) -> int:
@@ -172,9 +161,10 @@ def main(argv: list[str] | None = None) -> int:
     report["cuda"] = bool(torch.cuda.is_available())
     if not report["cuda"]:
         return done(1, "CUDA is not available to torch")
-    available = report["memory_available_gb"]
-    if available is not None and available < min_free:
-        return done(3, f"only {available} GB of memory available, need {min_free} GB")
+    enough, available, waited = wait_for_memory(min_free, read=free_memory_gb)
+    report["memory_available_gb"], report["waited_for_memory_s"] = available, waited
+    if not enough:
+        return done(3, f"only {available} GB of memory available after {waited:.0f} s, need {min_free} GB")
     capability = torch.cuda.get_device_capability(0)
     report["gpu"] = torch.cuda.get_device_name(0)
     report["capability"] = f"{capability[0]}.{capability[1]}"
