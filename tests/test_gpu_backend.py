@@ -219,6 +219,9 @@ class Doctor(unittest.TestCase):
     def test_ready(self):
         c, api = self.check();self.assertTrue(c.ok);api.ensure_server.assert_called_once();api.health.assert_called_once()
         self.assertNotIn('~', c.message)
+    def test_loaded_models_never_echo_host_paths(self):
+        c, _ = self.check(health={'memory_available_gb': 40, 'models_loaded': ['demucs:htdemucs', 'sam3:/home/u/gpu/models/sam3', 'vda-small:fused']})
+        self.assertIn('demucs:htdemucs, sam3, vda-small:fused', c.message);self.assertNotIn('/home', c.message)
     def test_low_memory_is_not_fatal(self):
         c, _ = self.check(health={'memory_available_gb': 5, 'models_loaded': []});self.assertFalse(c.ok);self.assertFalse(c.fatal)
     def test_unreachable_is_fatal(self):
