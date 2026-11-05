@@ -131,6 +131,19 @@ Archivos: `gpu_workers/server.py` (servidor, corre en el GPU host), `gpu_api.py`
 
 Aceptación: con el servidor arrancado por `ensure_server()` y accedido solo por el túnel, los tres modelos procesan `prueba-6s` y dan lo mismo que los CLI de F2 (mismos conteos de cuadros e instancias; profundidad con diferencia media < 1/255; máscaras idénticas o IoU ≥ 0.99); la segunda llamada a cada modelo es más rápida que la primera (se miden los tiempos de carga ahorrados); tras el tiempo de inactividad (acortado por variables en la prueba) se verifica la descarga de modelos y la salida del proceso; nada queda corriendo ni en disco del host al terminar; tests en la máquina local con servidor y modelos simulados (sin GPU) y cliente con HTTP simulado; tests viejos en verde.
 
+### F3c: el pipeline usa la API de inferencia y se elimina el transporte rsync
+
+Decisión de Carlos (2026-11-04): una vez unidas F3 (`51bbbbb`) y F3b (`7af5c7f`), `PREP_BACKEND=gpu` pasa a usar **solo** la API de F3b (`gpu_api.py`) y se borra el camino ssh/rsync de datos.
+
+- `gpu_backend.py` queda como fachada fina sobre `gpu_api.GpuApi` (o se reemplaza por un módulo equivalente) conservando las funciones que ya llaman `pipeline.py`, `audio_workflow.py`, `raw_masks.py`, `workflow.py`, `app.py` y `doctor.py` (`enabled`, `separate`, `depth`, `segment` y lo que use la selección), para no tocar más de lo necesario esos archivos.
+- Flujo por etapa: `ensure_server()` → `tunnel()` (uno por trabajo de preparación, no uno por etapa) → `upload()` del `original.mp4` / `original-audio.wav` normalizados → `predict()` → `download_all()` a la carpeta local del trabajo con los mismos nombres de archivo de F3 → borrar los archivos del servidor (`DELETE`). La selección de instancias sigue siendo local (`common.union_masks` sobre `instances/`).
+- Errores de `GpuApiError` (`low_memory`, `timeout`, `server_down`, …) se traducen a mensajes de estado claros; `low_memory` espera y reintenta según `GPU_MEM_WAIT_MIN`.
+- `doctor.py`: con `PREP_BACKEND=gpu` verifica ssh, que el servidor arranque o ya esté vivo y `/health` por el túnel; ya no corre `check.py` por ssh.
+- Se elimina todo `rsync` de datos de trabajo (código, tests y docs). `rsync` solo puede quedar documentado para desplegar el código de `gpu_workers/` al host.
+- `.env.example`: agregar `GPU_API_PORT`, `GPU_API_TOKEN`, `GPU_API_UNLOAD_IDLE_MIN`, `GPU_API_EXIT_IDLE_MIN`, `GPU_API_TTL_MIN`, `GPU_MEM_WAIT_MIN`, `GPU_MEM_POLL_S`; quitar las que solo usaba el transporte rsync.
+
+Aceptación: `workflow.py prepare <prueba-6s> --provider gpu --instances <ids>` produce los mismos archivos que en F3 (mismos conteos de cuadros; `composite.mp4` con diferencia media < 1/255 frente a la corrida de F3 de ese clip, si sigue en `runs/`), usando solo la API; `grep -rn rsync` en el código de trabajo no encuentra nada salvo el despliegue documentado; tests de F3 adaptados a la API simulada; suite completa en verde; servidor y túnel apagados al terminar y sin archivos de trabajo en el host.
+
 ### F4: capa de proveedores de generación (primero: Kie)
 
 Archivos: `providers/__init__.py` (registro y `get_provider()` por `GEN_BACKEND`), `providers/base.py`, `providers/enhancor.py` (lo de upstream movido sin cambiar comportamiento), `providers/kie.py`, `providers/openrouter.py`; `seedance_bridge.py` queda como fachada que delega; `doctor.py`.
