@@ -2,7 +2,65 @@ from pathlib import Path
 import os,json,time,zipfile,io
 import requests
 
-def segment_raw(video,folder,prompt='person'):
+def parse_ids(value):
+    """'1,2,4' or [1,2,4] -> sorted unique positive ints."""
+    parts=value.split(',') if isinstance(value,str) else list(value)
+    ids=set()
+    for part in parts:
+        part=str(part).strip()
+        if not part:continue
+        if not part.isdigit() or int(part)<1:raise ValueError(f'Instance ids are positive integers, got {part!r}.')
+        ids.add(int(part))
+    if not ids:raise ValueError('No instance ids given.')
+    return sorted(ids)
+
+def union_instances(folder,ids=None):
+    """Write raw-masks/mask_NNNNN.png as the per-frame union of instances/<id>/ (all instances when ids is None)."""
+    import numpy as np
+    from PIL import Image
+    folder=Path(folder);root=folder/'instances'
+    available=sorted(int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit()) if root.is_dir() else []
+    if not available:raise ValueError('No instance masks found; run the segmentation first.')
+    ids=available if ids is None else parse_ids(ids)
+    missing=[i for i in ids if i not in available]
+    if missing:raise ValueError(f'Unknown instance ids {missing}; available: {available}')
+    sequences=[sorted((root/str(i)).glob('mask_*.png')) for i in ids]
+    if len({len(x) for x in sequences})!=1 or not sequences[0]:raise ValueError(f'Instances {ids} have different or empty frame counts.')
+    out=folder/'raw-masks';out.mkdir(exist_ok=True)
+    for stale in out.glob('mask_*.png'):stale.unlink()
+    for i,paths in enumerate(zip(*sequences)):
+        merged=np.logical_or.reduce([np.asarray(Image.open(p).convert('L'))>127 for p in paths])
+        Image.fromarray(merged.astype(np.uint8)*255).save(out/f'mask_{i:05d}.png')
+    (folder/'instance-selection.json').write_text(json.dumps({'ids':ids,'available':available,'frames':len(sequences[0])}))
+    return out
+
+def reselect(folder,ids,status=print):
+    """Choose other instances for a GPU-prepared job: rebuild masks, composite and Seedance input.
+
+    This changes mask.mp4 and the composite, so any earlier mask-review approval no longer matches
+    (its fingerprint is bound to those files); the stale review file is also removed."""
+    from pipeline import composite
+    from audio_workflow import prepare_seedance_video
+    folder=Path(folder)
+    status('Instances · rebuilding the mask from the selected instances');union_instances(folder,ids)
+    selected=json.loads((folder/'instance-selection.json').read_text())['ids']
+    raw_dir=clean_border_fragments(folder/'raw-masks')
+    status('Compositing · depth subject over original background')
+    composite(folder/'original.mp4',folder/'depth.mp4',raw_dir,folder,folder/'upload.mp4')
+    status('Embedding isolated vocals · +3 semitones');prepare_seedance_video(folder)
+    (folder/'mask-review.json').unlink(missing_ok=True)
+    manifest=folder/'manifest.json'
+    if manifest.exists():
+        meta=json.loads(manifest.read_text());meta['instances']=selected;manifest.write_text(json.dumps(meta,indent=2))
+    return selected
+
+def segment_raw(video,folder,prompt='person',provider=None,instances=None,status=print):
+    import gpu_backend
+    if gpu_backend.enabled(provider):
+        folder=Path(folder)
+        gpu_backend.segment(video,folder,prompt,status)
+        status('SAM 3 · merging instances '+(str(instances) if instances else '(all)'))
+        return union_instances(folder,instances)
     folder=Path(folder);h={'Authorization':'Bearer '+os.environ['REPLICATE_API_TOKEN']}
     with open(video,'rb') as f:r=requests.post('https://api.replicate.com/v1/files',headers=h,files={'content':f},timeout=120)
     r.raise_for_status();url=r.json()['urls']['get']

@@ -125,22 +125,29 @@ def composite(original,depth,seg,directory,audio_source=None):
                 if packet.dts is not None:packet.stream=astream;output.mux(packet)
     return counts[0]
 
-def run(src,directory,prompt='person',provider='replicate',status=print):
+def run(src,directory,prompt='person',provider='replicate',status=print,instances=None):
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     from audio_workflow import separate
-    separate(src,directory,status)
+    import gpu_backend
+    gpu=gpu_backend.enabled(provider)
+    if gpu:provider='gpu'
+    separate(src,directory,status,provider)
     status('Preparing video · 24 fps');meta=normalize(src,directory/'original.mp4')
-    status('Video Depth Anything · generating depth')
-    if provider=='huggingface':depth_hf(directory/'original.mp4',directory/'depth-raw.mp4')
+    status('Video Depth Anything · generating depth'+(' on the GPU host' if gpu else ''))
+    if gpu:gpu_backend.depth(directory,status)
+    elif provider=='huggingface':depth_hf(directory/'original.mp4',directory/'depth-raw.mp4')
     else:depth_replicate(directory/'original.mp4',directory/'depth-raw.mp4', 'chenxwh/depth-any-video' if provider=='replicate-chenxwh' else 'lucataco/depth-anything-video')
     shutil.copyfile(directory/'depth-raw.mp4',directory/'depth.mp4')
-    status('SAM 3 · segmenting the depth subject')
+    status('SAM 3 · segmenting the original video on the GPU host' if gpu else 'SAM 3 · segmenting the depth subject')
     from raw_masks import segment_raw,clean_border_fragments
-    raw_dir=clean_border_fragments(segment_raw(directory/'depth.mp4',directory,prompt))
+    raw_dir=clean_border_fragments(segment_raw(directory/('original.mp4' if gpu else 'depth.mp4'),directory,prompt,provider,instances,status))
     status('Compositing · depth subject over original background')
     composite(directory/'original.mp4',directory/'depth.mp4',raw_dir,directory,src)
     from audio_workflow import prepare_seedance_video
     status('Embedding isolated vocals · +3 semitones')
     prepare_seedance_video(directory)
     meta.update(prompt=prompt,depth_provider=provider,sam_space=SAM,mask_method='SAM 3 raw PNG masks')
+    if gpu:
+        selection=json.loads((directory/'instance-selection.json').read_text())
+        meta.update(sam_space='SAM 3 on the GPU host',mask_method='SAM 3 raw PNG masks, per-instance (segmented on the original video)',instances=selection['ids'],instances_available=selection['available'])
     (directory/'manifest.json').write_text(json.dumps(meta,indent=2));status('Complete')

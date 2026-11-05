@@ -21,10 +21,12 @@ def write_audio(path,a):
             for p in s.encode(f):out.mux(p)
         for p in s.encode():out.mux(p)
 
-def separate(src,folder,status=print):
+def separate(src,folder,status=print,provider=None):
     folder=Path(folder)
     if (folder/'audio-manifest.json').exists():return
     status('Audio · extracting original track');original=read_audio(src);write_audio(folder/'original-audio.wav',original)
+    import gpu_backend
+    if gpu_backend.enabled(provider):return gpu_backend.separate(folder,status)
     token=os.getenv('REPLICATE_API_TOKEN')
     if not token:raise ValueError('REPLICATE_API_TOKEN is required for audio separation.')
     headers={'Authorization':'Bearer '+token}

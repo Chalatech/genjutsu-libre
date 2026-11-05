@@ -10,9 +10,15 @@ app=FastAPI();jobs={}
 @app.get('/')
 def index():return FileResponse(ROOT/'static/index.html')
 @app.post('/jobs')
-def create(video:UploadFile=File(...),prompt:str=Form('person'),provider:str=Form('replicate'),mode:str=Form('depth')):
+def create(video:UploadFile=File(...),prompt:str=Form('person'),provider:str=Form(''),mode:str=Form('depth'),instances:str=Form('')):
     if mode not in ['depth','face_mesh','depth_mesh']:raise HTTPException(400,'Unknown workflow mode')
-    if provider not in ['huggingface','replicate','replicate-chenxwh']:raise HTTPException(400,'Unknown provider')
+    import gpu_backend
+    provider=provider or ('gpu' if gpu_backend.enabled() else 'replicate')
+    if provider not in ['huggingface','replicate','replicate-chenxwh','gpu']:raise HTTPException(400,'Unknown provider')
+    if instances:
+        from raw_masks import parse_ids
+        try:instances=parse_ids(instances)
+        except ValueError as e:raise HTTPException(400,str(e))
     ident=uuid.uuid4().hex;folder=RUNS/ident;folder.mkdir();src=folder/'upload.mp4'
     with src.open('wb') as out:shutil.copyfileobj(video.file,out)
     jobs[ident]={'state':'running','status':'Starting','id':ident}
@@ -24,7 +30,7 @@ def create(video:UploadFile=File(...),prompt:str=Form('person'),provider:str=For
             elif mode=='depth_mesh':
                 from face_mesh import run_depth
                 run_depth(src,folder,prompt,provider,lambda s:jobs[ident].update(status=s))
-            else:run(src,folder,prompt,provider,lambda s:jobs[ident].update(status=s))
+            else:run(src,folder,prompt,provider,lambda s:jobs[ident].update(status=s),instances or None)
             jobs[ident].update(state='done',status='Preparation complete · input review required')
             (folder/'status.json').write_text(json.dumps(jobs[ident]))
         except Exception as e:
@@ -122,6 +128,22 @@ def create_hd(ident:str):
         save()
     threading.Thread(target=work_hd,daemon=True).start()
     return hd_jobs[ident]
+
+@app.get('/jobs/{ident}/instances')
+def get_instances(ident:str):
+    folder=hd_folder(ident)
+    if not (folder/'instances.json').exists():raise HTTPException(404,'This job has no instance listing (GPU preparation only).')
+    chosen=json.loads((folder/'instance-selection.json').read_text())['ids'] if (folder/'instance-selection.json').exists() else None
+    return {'selected':chosen,'contact_sheet':f'/runs/{ident}/instances-contact.jpg',**json.loads((folder/'instances.json').read_text())}
+
+@app.post('/jobs/{ident}/instances')
+def select_instances(ident:str,instances:str=Form(...)):
+    """Re-merge the mask from other instances; this invalidates any earlier mask approval."""
+    folder=hd_folder(ident)
+    from raw_masks import reselect
+    try:chosen=reselect(folder,instances)
+    except ValueError as e:raise HTTPException(409,str(e))
+    return {'selected':chosen,'mask_review':'pending'}
 
 @app.get('/jobs/{ident}/mask-review')
 def get_mask_review(ident:str):

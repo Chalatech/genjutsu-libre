@@ -4,14 +4,16 @@ from pathlib import Path
 from config import ROOT,load_env
 load_env()
 p=argparse.ArgumentParser();sub=p.add_subparsers(dest='command',required=True)
-c=sub.add_parser('prepare');c.add_argument('video');c.add_argument('--subject',default='person');c.add_argument('--provider',default='replicate',choices=['replicate','replicate-chenxwh','huggingface'])
-for command in ['status','repair-rgb','resume','hd','review','submit']:
+c=sub.add_parser('prepare');c.add_argument('video');c.add_argument('--subject',default='person');c.add_argument('--provider',default=None,choices=['replicate','replicate-chenxwh','huggingface','gpu'],help='default: gpu when PREP_BACKEND=gpu, else replicate');c.add_argument('--instances',help='GPU backend: comma-separated instance ids to replace (default: all detected)')
+for command in ['status','repair-rgb','resume','hd','review','submit','instances','select']:
  c=sub.add_parser(command);c.add_argument('job')
+ if command=='select':c.add_argument('--instances',required=True,help='comma-separated instance ids, e.g. 1,2,4,9')
  if command=='review':c.add_argument('--approve',action='store_true');c.add_argument('--fingerprint',required=True);c.add_argument('--note',required=True)
  if command=='submit':c.add_argument('--prompt-file',required=True);c.add_argument('--reference',required=True);c.add_argument('--second-reference')
  if command=='resume':c.add_argument('--hd',action='store_true')
 sub.choices['prepare'].add_argument('--mode',choices=['depth','face_mesh','depth_mesh'],default='depth')
 a=p.parse_args()
+import gpu_backend
 if a.command=='prepare':
  import uuid,shutil
  from pipeline import run
@@ -22,8 +24,8 @@ if a.command=='prepare':
   run_mesh(folder/'upload.mp4',folder)
  elif a.mode=='depth_mesh':
   from face_mesh import run_depth
-  run_depth(folder/'upload.mp4',folder,a.subject,a.provider)
- else:run(folder/'upload.mp4',folder,a.subject,a.provider)
+  run_depth(folder/'upload.mp4',folder,a.subject,a.provider or ('gpu' if gpu_backend.enabled() else 'replicate'))
+ else:run(folder/'upload.mp4',folder,a.subject,a.provider or ('gpu' if gpu_backend.enabled() else 'replicate'),instances=a.instances)
  (folder/'status.json').write_text(json.dumps({'id':folder.name,'state':'done','status':'Mask review required'}));raise SystemExit
 if len(a.job)!=32 or any(c not in '0123456789abcdef' for c in a.job):p.error('Expected a 32-character local job ID')
 folder=ROOT/'runs'/a.job
@@ -31,6 +33,16 @@ if not folder.is_dir():p.error('Job does not exist')
 if a.command=='status':
  from mask_review import state
  print(json.dumps({'mask_review':state(folder),'generation':json.loads((folder/'generation.json').read_text()) if (folder/'generation.json').exists() else None},indent=2))
+elif a.command=='instances':
+ listing=folder/'instances.json'
+ if not listing.exists():p.error('This job has no instance listing (only GPU-prepared jobs have one).')
+ data=json.loads(listing.read_text());chosen=json.loads((folder/'instance-selection.json').read_text())['ids'] if (folder/'instance-selection.json').exists() else None
+ print(json.dumps({'selected':chosen,'contact_sheet':str(folder/'instances-contact.jpg'),'instances':[{k:i[k] for k in ('id','first_frame','last_frame','frames_present','coverage')} for i in data['instances']]},indent=2))
+elif a.command=='select':
+ from raw_masks import reselect
+ try:chosen=reselect(folder,a.instances)
+ except ValueError as e:p.error(str(e))
+ print(json.dumps({'selected':chosen,'mask_review':'cleared; review the whole prepared video again'}))
 elif a.command=='review':
  from mask_review import review
  print(review(folder,a.approve,a.note,a.fingerprint))
@@ -42,7 +54,7 @@ elif a.command=='repair-rgb':
  from pipeline import composite
  from audio_workflow import prepare_seedance_video
  meta=json.loads((folder/'manifest.json').read_text());repair=folder/'rgb-repair';repair.mkdir(exist_ok=True)
- masks=clean_border_fragments(segment_raw(folder/'original.mp4',repair,meta.get('prompt','person')))
+ masks=clean_border_fragments(segment_raw(folder/'original.mp4',repair,meta.get('prompt','person'),meta.get('depth_provider'),meta.get('instances')))
  composite(folder/'original.mp4',folder/'depth.mp4',masks,folder,folder/'upload.mp4')
  if mode=='depth_mesh':
   import shutil,subprocess
