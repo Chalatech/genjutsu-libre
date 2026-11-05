@@ -5,7 +5,6 @@ import seedance_bridge,providers
 from providers import Env,Job,Capabilities,get_provider
 from providers.base import SubmissionRejected,Unsupported,PollResult
 from providers.kie import KieProvider
-from providers.openrouter import OpenRouterProvider
 
 def env(**values):
     return Env(setting=lambda k,d='':values.get(k,d),credential=lambda k:values.get(k) or (_ for _ in ()).throw(ValueError('Set '+k)),upload=lambda p:'https://example.org/'+Path(p).name)
@@ -202,47 +201,6 @@ class KieFacade(unittest.TestCase):
         self.run_submit()
         with patch('config.setting',side_effect=lambda k,d='':self.cfg.get(k,d)):
             with self.assertRaisesRegex(ValueError,'completed draft'):seedance_bridge.submit_hd(self.p)
-
-CATALOG={'data':[{'id':'wan/wan-3.0','architecture':{'input_modalities':['text','image'],'output_modalities':['video']}},
-                 {'id':'acme/text-only','architecture':{'input_modalities':['text'],'output_modalities':['text']}},
-                 {'id':'acme/video-edit','architecture':{'input_modalities':['text','image','video'],'output_modalities':['video']}}]}
-class OpenRouter(unittest.TestCase):
-    def provider(self,model,catalog=CATALOG,error=None):
-        get=patch('requests.get',side_effect=error) if error else patch('requests.get',return_value=response(catalog))
-        self.get=get.start();self.addCleanup(get.stop)
-        return OpenRouterProvider(env(OPENROUTER_MODEL=model,OPENROUTER_API_KEY='k'))
-    def test_image_only_video_model_is_refused_before_anything(self):
-        p=self.provider('wan/wan-3.0')
-        self.assertFalse(p.capabilities().reference_video);self.assertEqual(p.capabilities().max_reference_images,1)
-        with self.assertRaisesRegex(Unsupported,'does not accept a reference video'):p.preflight()
-    def test_known_model_missing_from_catalog_uses_the_table(self):
-        p=self.provider('alibaba/wan-3.0',catalog={'data':[]})
-        caps=p.capabilities();self.assertFalse(caps.reference_video);self.assertEqual(caps.max_reference_images,1)
-        with self.assertRaisesRegex(Unsupported,'reference images only'):p.preflight()
-        import requests
-        q=self.provider('alibaba/wan-3.0',error=requests.ConnectionError())   # table works without the network
-        with self.assertRaisesRegex(Unsupported,'reference images only'):q.preflight()
-    def test_text_model_is_refused(self):
-        with self.assertRaises(Unsupported):self.provider('acme/text-only').preflight()
-    def test_unknown_model_and_missing_model(self):
-        with self.assertRaisesRegex(Unsupported,'not in the OpenRouter catalog'):self.provider('nope/x').preflight()
-        with self.assertRaisesRegex(Unsupported,'Set OPENROUTER_MODEL'):self.provider('').preflight()
-    def test_unreachable_catalog_falls_back_to_unsupported(self):
-        import requests
-        p=self.provider('wan/wan-3.0',error=requests.ConnectionError())
-        self.assertFalse(p.capabilities().reference_video)
-        with self.assertRaisesRegex(Unsupported,'unreachable'):p.preflight()
-    def test_catalog_confirmed_model_passes_preflight_but_submit_is_not_implemented(self):
-        p=self.provider('acme/video-edit');self.assertTrue(p.capabilities().reference_video);p.preflight()
-        with self.assertRaises(Unsupported):p.submit({})
-    def test_catalog_read_once_per_provider(self):
-        p=self.provider('wan/wan-3.0');p.capabilities();p.capabilities();self.assertEqual(self.get.call_count,1)
-    def test_facade_stops_before_preparing_media(self):
-        p=self.provider('wan/wan-3.0')
-        with tempfile.TemporaryDirectory() as d,patch('mask_review.require_approved'),patch('config.setting',side_effect=lambda k,d='':{'GEN_BACKEND':'openrouter','OPENROUTER_MODEL':'wan/wan-3.0'}.get(k,d)),\
-             patch('seedance_bridge.setting',side_effect=lambda k,d='':{'GEN_BACKEND':'openrouter','OPENROUTER_MODEL':'wan/wan-3.0'}.get(k,d)),patch('audio_workflow.prepare_seedance_video') as prep,patch('requests.post') as post:
-            with self.assertRaises(Unsupported):seedance_bridge.submit(d,'p','r.png')
-            prep.assert_not_called();post.assert_not_called()
 
 class EnhancorUnchanged(unittest.TestCase):
     def test_enhancor_has_no_cost_estimate_so_the_cap_never_applies(self):

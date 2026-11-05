@@ -45,14 +45,14 @@ built from the registry, with each provider's capabilities and an estimated cost
 
 | | `enhancor` | `kie` | `openrouter` |
 |---|---|---|---|
-| Reference video (this workflow needs it) | yes | yes | **no** (see below) |
-| Reference images | up to 2 | up to 30 | images only |
-| Draft then final pass | yes (draft, then 1080p) | yes (480p draft, then 720p/1080p) | no |
-| Duration | 4-30 s | 4-30 s, or `-1` = same as the input | n/a |
+| Reference video (this workflow needs it) | yes | yes | yes, Seedance 2 and newer (`video_url` references) |
+| Reference images | up to 2 | up to 30 | up to 30 (`OPENROUTER_MAX_REF_IMAGES`) |
+| Draft then final pass | yes (draft, then 1080p) | yes (480p draft, then 720p/1080p) | no draft: the second pass is a new, separately billed generation at a higher resolution |
+| Duration | 4-30 s | 4-30 s, or `-1` = same as the input | 4-30 s, integers; the source length rounded and clamped |
 | Needs a webhook | yes (cloudflared tunnel or your own URL) | no, polling | no |
-| Public media URLs | tmpfiles / catbox | no, uses Kie's file API (kept 24 h) | n/a |
+| Public media URLs | tmpfiles / catbox | no, uses Kie's file API (kept 24 h) | yes, OpenRouter has no storage: Kie's file API or tmpfiles (`OPENROUTER_MEDIA_HOST`) |
 | Real faces accepted | yes (`pass_faces`) | unknown, measured in the first real run | unknown |
-| Price | per plan | `KIE_UNIT_CREDITS` x billable seconds x $0.005 | n/a |
+| Price | per plan | `KIE_UNIT_CREDITS` x billable seconds x $0.005 | per video token (Seedance 2.5: $0.0000107, or $0.0000064 with a video input); the real `usage.cost` is stored |
 
 ### Kie.ai (`GEN_BACKEND=kie`)
 
@@ -77,15 +77,36 @@ If the final pass rejects 720p, Kie's own docs list only 1080p for the draft com
 
 ### OpenRouter (`GEN_BACKEND=openrouter`)
 
-Capabilities are declared per configured model (`OPENROUTER_MODEL`). The public catalog
-(`GET /api/v1/models`, free) does **not** list video models, so a model missing from it proves nothing. The
-provider therefore uses the catalog when it does list the model, otherwise a small table of known models
-(`KNOWN_MODELS` in `providers/openrouter.py`), otherwise treats the model as unsupported.
+Model `OPENROUTER_MODEL` (default `bytedance/seedance-2.5`) through the asynchronous video API
+(`POST /api/v1/videos`, then `GET /api/v1/videos/{id}` until `completed`). The composite goes first as a
+`video_url` entry of `input_references`, then the character images as `image_url` entries, with the same
+`@Video1` / `@Image1...` notes as Kie. OpenRouter documents that audio and video references are honored only by
+providers that support them, including BytePlus Seedance generation 2 and newer, so this workflow runs only
+with those models. Any other model (for example `alibaba/wan-3.0`, image references only) stops before anything
+is prepared or uploaded.
 
-As of 2026-11-04, OpenRouter's Wan 3.0 (`alibaba/wan-3.0`) accepts **only image references**, not a reference
-video, so it cannot run this workflow yet: the run stops before anything is prepared or uploaded, with an
-explicit message. Submission is implemented only for what is confirmed to work, which today is nothing. Use
-`kie` or `enhancor`.
+* **Capabilities** come from the free `GET /api/v1/videos/models` (the general `/api/v1/models` catalog does
+  not list video models), with a small table of known models as fallback (`KNOWN_MODELS`).
+* **Request**: `duration` is the source length rounded and clamped to the supported durations (4-30 s),
+  `resolution` is `OPENROUTER_RESOLUTION` (default `480p`), `aspect_ratio` is the supported one closest to the
+  source, `generate_audio` is `false` (the original audio is restored afterwards).
+* **Media host**: OpenRouter has no file storage and needs public HTTPS URLs. `OPENROUTER_MEDIA_HOST=kie`
+  uploads through Kie's file API (needs `KIE_API_KEY`; the default when that key exists); `tmpfiles` uses
+  tmpfiles with no fallback hosts. Catbox is never used for this provider.
+* **Billing**: per video token, not per second. The pre-send estimate (checked against `GEN_MAX_USD`) is an
+  estimate only: width x height x 24 fps x seconds / 1024 tokens for the output plus the input video, at the
+  video-input rate. The real price is `usage.cost` from the completed job; it is saved as
+  `provider-usage.json` next to the result.
+* **No draft**: OpenRouter has no draft concept. "HD" (`submit_hd`) submits a **new generation** at the next
+  higher resolution (720p), billed again in full. It does not reuse or upscale the first task.
+* **Keys**: `OPENROUTER_API_KEY`, or `OPENROUTER_KEY` when that one is unset.
+* Local input limits default to Kie's documented Seedance 2.5 limits (24-60 fps, 2-30 s, 409 600-927 408 px,
+  sizes 300-6000 px); override with `OPENROUTER_MIN_PIXELS`, `OPENROUTER_MAX_PIXELS`,
+  `OPENROUTER_MAX_REF_SECONDS` and `OPENROUTER_MAX_REF_IMAGES`.
+
+More than two character images: `workflow.py submit --reference a.png --reference b.png --reference c.png`
+(the first is primary; `--second-reference` still works). `seedance_bridge.submit(..., extra_references=[...])`
+is the same thing for callers. Providers cap the count with `max_reference_images` (Enhancor: 2).
 
 ### Enhancor (`GEN_BACKEND=enhancor`)
 

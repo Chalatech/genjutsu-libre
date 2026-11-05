@@ -26,7 +26,8 @@ class AppUi(unittest.TestCase):
         self.assertNotIn('through Enhancor',r.text)
 
     def test_config_lists_registry_capabilities_and_defaults_from_env(self):
-        j=self.client.get('/config').json()
+        with mock.patch.dict(os.environ,{'OPENROUTER_MODEL':'alibaba/wan-3.0'}),mock.patch('requests.get',side_effect=__import__('requests').ConnectionError):
+            j=self.client.get('/config').json()
         self.assertEqual(j['prep_default'],'gpu');self.assertEqual(j['gen_default'],'kie')
         by={p['name']:p for p in j['providers']}
         self.assertEqual(set(by),{'enhancor','kie','openrouter'})

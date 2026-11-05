@@ -33,11 +33,11 @@ def _upload_once(path,host):
     return url
 
 
-def upload(path):
-    """Retry hosting only; never retries a paid model request."""
+def upload(path,hosts=None):
+    """Retry hosting only; never retries a paid model request. `hosts` overrides MEDIA_HOST and the fallbacks."""
     primary=setting('MEDIA_HOST','tmpfiles')
     fallback=setting('MEDIA_HOST_FALLBACKS','catbox')
-    hosts=list(dict.fromkeys([primary]+[h.strip() for h in fallback.split(',') if h.strip()]))
+    hosts=list(hosts) if hosts else list(dict.fromkeys([primary]+[h.strip() for h in fallback.split(',') if h.strip()]))
     if any(h not in ['tmpfiles','catbox'] for h in hosts):raise ValueError('Supported media hosts: tmpfiles, catbox')
     errors=[]
     for host in hosts:
