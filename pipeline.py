@@ -126,6 +126,11 @@ def composite(original,depth,seg,directory,audio_source=None):
     return counts[0]
 
 def run(src,directory,prompt='person',provider='replicate',status=print,instances=None):
+    import gpu_backend
+    if not gpu_backend.enabled(provider):return _run(src,directory,prompt,provider,status,instances)
+    with gpu_backend.session(status):return _run(src,directory,prompt,provider,status,instances)   # one tunnel for the whole job
+
+def _run(src,directory,prompt='person',provider='replicate',status=print,instances=None):
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     from audio_workflow import separate
     import gpu_backend

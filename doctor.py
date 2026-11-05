@@ -15,23 +15,23 @@ def prep_checks():
     return checks
 
 def gpu_checks():
-    """GPU host: ssh reachable and the host's own environment check passes (no output is echoed: it names host paths)."""
-    import json,subprocess
+    """GPU host: ssh reachable, inference server alive (or startable) and /health through the tunnel (host paths are never echoed)."""
     from providers import Check
     host,directory=setting('GPU_HOST'),setting('GPU_DIR')
     if not host or not directory:return [Check('GPU_HOST',False,'GPU_HOST / GPU_DIR: MISSING (PREP_BACKEND=gpu)',fatal=True)]
     import gpu_backend
-    python=setting('GPU_PYTHON') or directory.rstrip('/')+'/.venv/bin/python'
-    command=f'cd {gpu_backend.remote_path(directory)} && GPU_MEM_WAIT_MIN=0 {gpu_backend.remote_path(python)} workers/check.py'
-    try:r=subprocess.run(gpu_backend.SSH+[host,command],capture_output=True,text=True,timeout=180)
-    except subprocess.TimeoutExpired:return [Check('GPU host',False,'GPU host: no answer within 180 s',fatal=True)]
-    if r.returncode==255:return [Check('GPU host',False,'GPU host: unreachable over ssh',fatal=True)]
-    try:info=json.loads(r.stdout)
-    except ValueError:info={}
-    free=info.get('memory_available_gb')
-    if r.returncode==0:return [Check('GPU host',True,f'GPU host: reachable, {info.get("gpu","GPU")} ready, {free} GB memory available')]
-    if r.returncode==3:return [Check('GPU host memory',False,f'GPU host: reachable but only {free} GB memory available (need {info.get("min_free_gb")} GB); workers will wait')]
-    return [Check('GPU host',False,'GPU host: environment check failed ('+str(info.get('error') or 'exit '+str(r.returncode))[:120]+')',fatal=True)]
+    from gpu_api import GpuApi,GpuApiError
+    api=GpuApi.from_env(python=setting('GPU_PYTHON') or directory.rstrip('/')+'/.venv/bin/python')
+    try:
+        ssh=api.ssh('true',timeout=30)
+        if ssh.returncode!=0:return [Check('GPU host',False,'GPU host: unreachable over ssh',fatal=True)]
+        api.ensure_server(env=gpu_backend.server_env())
+        with api.tunnel():health=api.health()
+    except GpuApiError as exc:return [Check('GPU host',False,f'GPU host: inference server not ready ({exc.code}: {str(exc)[:120]})',fatal=True)]
+    free,need=health.get('memory_available_gb'),float(setting('GPU_MIN_FREE_GB','20'))
+    loaded=', '.join(health.get('models_loaded') or []) or 'none'
+    if free is not None and free<need:return [Check('GPU host memory',False,f'GPU host: server up but only {free} GB memory available (need {need:g} GB); stages will wait')]
+    return [Check('GPU host',True,f'GPU host: server up through the tunnel, {free} GB memory available, models loaded: {loaded}')]
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--require-keys',action='store_true');parser.add_argument('--mesh',action='store_true');args=parser.parse_args()

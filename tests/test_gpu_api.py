@@ -197,6 +197,17 @@ class ClientSsh(unittest.TestCase):
         for part in ('nohup setsid nice -n 10', 'workers/server.py --port 18770', 'GPU_API_EXIT_IDLE_MIN=1', 'GPU_API_TOKEN=t0k', '< /dev/null &) > /dev/null 2>&1 < /dev/null ; echo started'):
             self.assertIn(part, text)
 
+    def test_home_relative_paths_stay_expandable(self):
+        run = MagicMock(side_effect=[SimpleNamespace(returncode=0, stdout=o, stderr='') for o in ['', 'started\n', '{"status": "ok"}']])
+        api = gpu_api.GpuApi('gpu', '~/carlos/gpu', '~/carlos/gpu/.venv/bin/python', run=run, sleep=lambda s: None)
+        api.ensure_server()
+        for call in run.call_args_list:
+            text = call.args[0][-1]
+            self.assertNotIn("'~", text);self.assertNotIn('"~', text)
+        start = run.call_args_list[1].args[0][-1]
+        self.assertIn('mkdir -p "$HOME"/carlos/gpu/run', start);self.assertIn('GPU_DIR="$HOME"/carlos/gpu ', start)
+        self.assertIn('"$HOME"/carlos/gpu/.venv/bin/python "$HOME"/carlos/gpu/workers/server.py', start)
+
     def test_ensure_server_fails_clearly(self):
         api, run = self.make(['', 'started'] + [''] * 60)
         with self.assertRaises(gpu_api.GpuApiError) as ctx:

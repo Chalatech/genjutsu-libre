@@ -1,36 +1,37 @@
-"""Preparation workers on a remote GPU host, driven over ssh/rsync (PREP_BACKEND=gpu).
+"""Preparation stages on the GPU host through its inference API (PREP_BACKEND=gpu).
 
-Configuration (.env): GPU_HOST (ssh alias), GPU_DIR (the only folder written on the host),
-GPU_PYTHON (the venv python on the host), GPU_MIN_FREE_GB / GPU_MEM_POLL_S / GPU_MEM_WAIT_MIN.
+Everything runs on this machine except the inference. A preparation job opens one session:
+``ensure_server()`` (starts the server on the host if it is not alive) and one ssh tunnel to its
+loopback-only port. Each stage uploads its normalized input, runs the model, downloads the
+outputs into the job folder under the same file names as always, and deletes the host copies.
 
-Every stage is self-contained and leaves nothing behind on the host:
-push the inputs to ``$GPU_DIR/jobs/<job>/in`` -> run one worker (``nice -n 10``, one at a time,
-remote ``timeout``) -> pull ``jobs/<job>/out`` -> delete ``jobs/<job>`` (always, even on failure).
-Nothing here kills remote processes; the only limit is the remote ``timeout`` around our own worker.
+Configuration (.env): GPU_HOST, GPU_DIR, GPU_PYTHON, GPU_API_PORT, GPU_API_TOKEN, and the
+server's own limits GPU_MIN_FREE_GB / GPU_MEM_POLL_S / GPU_MEM_WAIT_MIN (low memory is waited
+out on the host, then reported as GpuMemoryError) and GPU_API_UNLOAD_IDLE_MIN /
+GPU_API_EXIT_IDLE_MIN / GPU_API_TTL_MIN. See ``gpu_api.py`` for the client itself.
 """
 from __future__ import annotations
 
+import contextlib
 import json
-import re
-import shlex
 import shutil
-import subprocess
-import time
+import threading
 from pathlib import Path
 
 from config import setting
+from gpu_api import GpuApi, GpuApiError
 
-SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
-JOB_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
-TIMEOUTS = {'separate': 900, 'depth': 1800, 'segment': 3600}   # seconds; segment ~0.8 s/frame with many objects
+TIMEOUTS = {'separate': 900, 'depth': 1800, 'segment': 3600}   # seconds of compute; segment ~0.8 s/frame with many objects
+SERVER_SETTINGS = ('GPU_MIN_FREE_GB', 'GPU_MEM_POLL_S', 'GPU_MEM_WAIT_MIN',
+                   'GPU_API_UNLOAD_IDLE_MIN', 'GPU_API_EXIT_IDLE_MIN', 'GPU_API_TTL_MIN')
 
 
 class GpuError(RuntimeError):
-    """A remote stage failed (the message carries the worker's own error when it printed one)."""
+    """A stage failed on the GPU host (the message carries the worker's own error when it printed one)."""
 
 
 class GpuUnreachable(GpuError):
-    """ssh could not reach the GPU host."""
+    """The GPU host or its server could not be reached."""
 
 
 class GpuMemoryError(GpuError):
@@ -44,163 +45,132 @@ def enabled(provider=None):
     return provider == 'gpu'
 
 
-def remote_path(path):
-    """Quote a remote path for the shell, keeping a leading ``~/`` expandable."""
-    path = str(path)
-    if path == '~':return '"$HOME"'
-    if path.startswith('~/'):return '"$HOME"/'+shlex.quote(path[2:])
-    return shlex.quote(path)
+def translate(error: GpuApiError, what: str) -> GpuError:
+    if error.code == 'low_memory':return GpuMemoryError(f'{what}: the GPU host ran out of free memory ({error})')
+    if error.code in ('server_down', 'unauthorized'):return GpuUnreachable(f'{what}: {error}')
+    if error.code == 'timeout':return GpuError(f'{what}: timed out ({error})')
+    return GpuError(f'{what} failed on the GPU host ({error.code}): {error}')
+
+
+def server_env():
+    """Limits the server is started with (only the ones configured; the server has its own defaults)."""
+    return {k: setting(k) for k in SERVER_SETTINGS if setting(k)}
 
 
 class Gpu:
-    def __init__(self, host=None, directory=None, python=None, status=print, sleep=time.sleep, clock=time.monotonic):
-        self.host = host or setting('GPU_HOST')
-        self.dir = (directory or setting('GPU_DIR')).rstrip('/')
-        if not self.host or not self.dir:raise ValueError('Set GPU_HOST and GPU_DIR in this project’s .env file (see docs/PLAN-BACKENDS.md).')
-        self.python = python or setting('GPU_PYTHON') or self.dir+'/.venv/bin/python'
-        self.status, self.sleep, self.clock = status, sleep, clock
+    def __init__(self, api=None, status=print):
+        if api is None:
+            if not setting('GPU_HOST') or not setting('GPU_DIR'):
+                raise ValueError('Set GPU_HOST and GPU_DIR in this project’s .env file (see docs/PLAN-BACKENDS.md).')
+            api = GpuApi.from_env(python=setting('GPU_PYTHON') or setting('GPU_DIR').rstrip('/')+'/.venv/bin/python')
+        self.api, self.status = api, status
 
-    # ---- plumbing -----------------------------------------------------------------
-    def job_dir(self, job):
-        if not JOB_RE.match(str(job)):raise ValueError(f'Unsafe job name {job!r}.')
-        return f'{self.dir}/jobs/{job}'
+    def timeout(self, model):
+        return TIMEOUTS.get(model, 1800)+float(setting('GPU_MEM_WAIT_MIN', '30'))*60
 
-    def ssh(self, command, timeout=60):
-        try:r = subprocess.run(SSH+[self.host, command], capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired as exc:raise GpuUnreachable(f'GPU host did not answer within {timeout} s.') from exc
-        if r.returncode == 255:
-            lines = (r.stderr or '').strip().splitlines()
-            raise GpuUnreachable('Cannot reach the GPU host over ssh'+(': '+lines[-1] if lines else '.'))
-        return r
+    def stage(self, model, source, data=None, upload_name=None, folder=None):
+        """upload ``source`` -> predict -> download into ``<folder>/gpu-out`` -> delete the host copies. Returns that folder.
 
-    def rsync(self, args, timeout=900):
-        r = subprocess.run(['rsync', '-az', '-e', ' '.join(SSH)]+args, capture_output=True, text=True, timeout=timeout)
-        if r.returncode != 0:raise GpuError(f'rsync failed ({r.returncode}): '+(r.stderr or '').strip()[-300:])
-
-    # ---- memory -------------------------------------------------------------------
-    def free_gb(self):
-        r = self.ssh("grep MemAvailable /proc/meminfo")
-        try:return round(int(r.stdout.split()[1])/1024/1024, 1)
-        except (IndexError, ValueError):return None
-
-    def wait_for_memory(self):
-        """Same policy as the workers: re-check every GPU_MEM_POLL_S for up to GPU_MEM_WAIT_MIN."""
-        need = float(setting('GPU_MIN_FREE_GB', '20'))
-        poll = float(setting('GPU_MEM_POLL_S', '120'));limit = float(setting('GPU_MEM_WAIT_MIN', '30'))*60
-        started = self.clock()
-        while True:
-            free = self.free_gb()
-            if free is None or free >= need:return free
-            waited = self.clock()-started
-            if waited+poll > limit:
-                raise GpuMemoryError(f'GPU host has {free} GB of memory available, {need:g} GB needed; gave up after {waited:.0f} s. Retry later.')
-            self.status(f'GPU host · only {free} GB free, waiting for {need:g} GB')
-            self.sleep(poll)
-
-    # ---- one stage ----------------------------------------------------------------
-    def push(self, job, folder, names):
-        base = self.job_dir(job)
-        self.ssh(f'mkdir -p {remote_path(base+"/in")} {remote_path(base+"/out")}')
-        self.rsync([str(Path(folder)/n) for n in names]+[f'{self.host}:{base}/in/'])
-
-    def run(self, worker, job, args=(), folder=None, timeout=None):
-        """Run one worker; return its JSON summary. Progress lines go to ``status`` and ``gpu-logs/<worker>.log``."""
-        base = self.job_dir(job);timeout = int(timeout or TIMEOUTS.get(worker, 1800))
-        self.wait_for_memory()
-        command = (f'cd {remote_path(self.dir)} && nice -n 10 timeout -k 30 {timeout} {remote_path(self.python)} workers/{worker}.py '
-                   f'--in {remote_path(base+"/in")} --out {remote_path(base+"/out")} '+' '.join(shlex.quote(str(a)) for a in args))
-        log = None
-        if folder is not None:
-            (Path(folder)/'gpu-logs').mkdir(exist_ok=True);log = (Path(folder)/'gpu-logs'/f'{worker}.log').open('w')
-        summary = {};tail = []
+        ``data`` are the extra model options; the uploaded file id goes in the model's file key."""
+        key = {'separate': 'audio'}.get(model, 'video')
+        out = Path(folder)/'gpu-out'
+        shutil.rmtree(out, ignore_errors=True)
+        file_id, output = None, {}
         try:
-            proc = subprocess.Popen(SSH+[self.host, command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in proc.stdout:
-                line = line.rstrip('\n')
-                if log:log.write(line+'\n');log.flush()
-                if line.startswith('{'):
-                    try:summary = json.loads(line);continue
-                    except ValueError:pass
-                tail.append(line);tail[:] = tail[-8:]
-                if line.startswith('['):self.status('GPU host · '+line)
-            code = proc.wait()
+            file_id = self.api.upload(Path(source), upload_name)
+            output = self.api.predict(model, {key: file_id, **(data or {})}, timeout=self.timeout(model),
+                                      on_status=lambda s: self.status(f'GPU host · {model} {s}'))
+            file_id = None   # consumed by the job
+            self.api.download_all(output, out)
+            output = {}
+        except GpuApiError as exc:
+            raise translate(exc, model) from exc
         finally:
-            if log:log.close()
-        if code == 0:return summary
-        error = summary.get('error') or ' | '.join(tail[-3:])
-        if code == 3:raise GpuMemoryError(f'{worker}: GPU host ran out of free memory ({error})')
-        if code == 255:raise GpuUnreachable(f'{worker}: lost the ssh connection ({error})')
-        if code == 124:raise GpuError(f'{worker}: stopped after the {timeout} s limit')
-        raise GpuError(f'{worker} failed on the GPU host (exit {code}): {error}')
+            for leftover in ([file_id] if file_id else [])+list(output.values()):self.api.delete(leftover)
+        self.record(model, folder, out)
+        return out
 
-    def pull(self, job, dest):
-        Path(dest).mkdir(parents=True, exist_ok=True)
-        self.rsync([f'{self.host}:{self.job_dir(job)}/out/', str(dest)+'/'])
-
-    def cleanup(self, job):
-        base = self.job_dir(job)
-        if not base.startswith(self.dir+'/jobs/'):return
-        try:self.ssh(f'rm -rf {remote_path(base)}', timeout=120)
-        except GpuError:pass
-
-    def stage(self, worker, folder, names, args=(), timeout=None, source=None):
-        """push (from ``source``, default ``folder``) -> run -> pull into ``<folder>/gpu-out`` -> delete the host copy."""
-        folder = Path(folder);job = job_name(folder);out = folder/'gpu-out'
-        try:
-            self.push(job, source or folder, names)
-            summary = self.run(worker, job, args, folder, timeout)
-            self.pull(job, out)
-        finally:
-            self.cleanup(job)
-        reports = folder/'gpu-reports';reports.mkdir(exist_ok=True)
+    def record(self, model, folder, out):
+        reports = Path(folder)/'gpu-reports';reports.mkdir(exist_ok=True)
         for report in out.glob('report-*.json'):shutil.copy2(report, reports/report.name)
-        return summary, out
+        if self.api.last_metrics:(reports/f'api-{model}.json').write_text(json.dumps(self.api.last_metrics, indent=2))
 
 
-def job_name(folder):
-    """Host job id: the job folder name (the repair pass lives in ``<job>/rgb-repair``)."""
-    folder = Path(folder)
-    return f'{folder.parent.name}-{folder.name}' if folder.name == 'rgb-repair' else folder.name
+_lock = threading.Lock()
+_state = {'gpu': None, 'users': 0, 'stack': None}
+
+
+@contextlib.contextmanager
+def session(status=print):
+    """One server check and one tunnel for everything inside the block; nested/concurrent users share it."""
+    with _lock:
+        if _state['users'] == 0:
+            gpu = Gpu(status=status)
+            stack = contextlib.ExitStack()
+            try:
+                status('GPU host · connecting')
+                try:
+                    gpu.api.ensure_server(env=server_env())
+                    stack.enter_context(gpu.api.tunnel())
+                except GpuApiError as exc:raise translate(exc, 'GPU host') from exc
+            except BaseException:
+                stack.close();raise
+            _state.update(gpu=gpu, stack=stack)
+        _state['users'] += 1
+        gpu = _state['gpu']
+    try:
+        yield gpu
+    finally:
+        with _lock:
+            _state['users'] -= 1
+            if _state['users'] == 0:
+                stack, _state['gpu'], _state['stack'] = _state['stack'], None, None
+                stack.close()
 
 
 # ---- the three routed stages ---------------------------------------------------------
 def separate(folder, status=print, gpu=None):
     """Demucs on the host. Expects ``original-audio.wav`` in the job folder; writes the stems and audio-manifest.json."""
-    folder = Path(folder);gpu = gpu or Gpu(status=status)
+    folder = Path(folder)
     status('Audio · separating vocals and music on the GPU host')
-    _, out = gpu.stage('separate', folder, ['original-audio.wav'])
-    for name in ('vocals.wav', 'music.wav', 'audio-manifest.json'):
-        if not (out/name).exists():raise GpuError(f'separate: {name} missing from the host output.')
-    for wav in out.glob('*.wav'):
-        if wav.name != 'original-audio.wav':shutil.copy2(wav, folder/wav.name)
-    shutil.copy2(out/'audio-manifest.json', folder/'audio-manifest.json')
-    shutil.rmtree(out, ignore_errors=True)
+    with contextlib.ExitStack() as stack:
+        gpu = gpu or stack.enter_context(session(status))
+        out = gpu.stage('separate', folder/'original-audio.wav', {'job_id': folder.name}, folder=folder)
+    try:
+        for name in ('vocals.wav', 'music.wav', 'audio-manifest.json'):
+            if not (out/name).exists():raise GpuError(f'separate: {name} missing from the host output.')
+        for wav in out.glob('*.wav'):
+            if wav.name != 'original-audio.wav':shutil.copy2(wav, folder/wav.name)
+        shutil.copy2(out/'audio-manifest.json', folder/'audio-manifest.json')
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def depth(folder, status=print, gpu=None):
     """Video-Depth-Anything Small on the host: ``original.mp4`` -> ``depth-raw.mp4``."""
-    folder = Path(folder);gpu = gpu or Gpu(status=status)
-    _, out = gpu.stage('depth', folder, ['original.mp4'])
-    if not (out/'depth-raw.mp4').exists():raise GpuError('depth: depth-raw.mp4 missing from the host output.')
-    shutil.copy2(out/'depth-raw.mp4', folder/'depth-raw.mp4')
-    shutil.rmtree(out, ignore_errors=True)
+    folder = Path(folder)
+    with contextlib.ExitStack() as stack:
+        gpu = gpu or stack.enter_context(session(status))
+        out = gpu.stage('depth', folder/'original.mp4', folder=folder)
+    try:
+        if not (out/'depth-raw.mp4').exists():raise GpuError('depth: depth-raw.mp4 missing from the host output.')
+        shutil.copy2(out/'depth-raw.mp4', folder/'depth-raw.mp4')
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def segment(video, folder, prompt='person', status=print, gpu=None):
     """SAM 3 on the host: one mask sequence per instance in ``<folder>/instances`` plus ``instances.json`` and the contact sheet."""
-    folder = Path(folder);gpu = gpu or Gpu(status=status)
-    folder.mkdir(parents=True, exist_ok=True)
-    staging = folder/'.segment-in'
-    shutil.rmtree(staging, ignore_errors=True);staging.mkdir()
+    folder = Path(folder);folder.mkdir(parents=True, exist_ok=True)
+    with contextlib.ExitStack() as stack:
+        gpu = gpu or stack.enter_context(session(status))
+        out = gpu.stage('segment', video, {'prompt': prompt}, upload_name='original.mp4', folder=folder)
     try:
-        shutil.copy2(video, staging/'original.mp4')
-        _, out = gpu.stage('segment', folder, ['original.mp4'], ['--prompt', prompt], source=staging)
+        for name in ('instances.json', 'instances-contact.jpg'):
+            if not (out/name).exists():raise GpuError(f'segment: {name} missing from the host output.')
+            shutil.copy2(out/name, folder/name)
+        shutil.rmtree(folder/'instances', ignore_errors=True)
+        shutil.move(str(out/'instances'), str(folder/'instances'))
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    for name in ('instances.json', 'instances-contact.jpg'):
-        if not (out/name).exists():raise GpuError(f'segment: {name} missing from the host output.')
-        shutil.copy2(out/name, folder/name)
-    shutil.rmtree(folder/'instances', ignore_errors=True)
-    shutil.move(str(out/'instances'), str(folder/'instances'))
-    shutil.rmtree(out, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
     return json.loads((folder/'instances.json').read_text())

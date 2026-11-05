@@ -3,7 +3,7 @@
 Everything runs on this machine except the inference: ``ensure_server()`` starts the server on
 the GPU host over ssh if it is not alive, ``tunnel()`` forwards a local port to the host's
 loopback-only port, and ``upload`` / ``predict`` / ``download`` talk plain HTTP through it.
-No rsync: job data travels through the API and is deleted from the host after download.
+No file sync: job data travels through the API and is deleted from the host after download.
 
     api = GpuApi.from_env()           # GPU_HOST, GPU_DIR, GPU_PYTHON, GPU_API_PORT, GPU_API_TOKEN
     api.ensure_server()
@@ -34,6 +34,16 @@ class GpuApiError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(f"{code}: {message}")
         self.code, self.message = code, message
+
+
+def remote_path(path: str) -> str:
+    """Quote a path for the host's shell, keeping a leading ``~/`` expandable (quoted ``~`` is literal)."""
+    path = str(path)
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
 
 
 def free_port() -> int:
@@ -76,7 +86,7 @@ class GpuApi:
         script = (f"import json,urllib.request as u;r=u.Request('http://127.0.0.1:{self.port}/health'"
                   + (f",headers={{'Authorization':'Bearer '+{self.token!r}}}" if self.token else "")
                   + ");print(u.urlopen(r,timeout=5).read().decode())")
-        result = self.ssh(f"{shlex.quote(self.python)} -c {shlex.quote(script)} 2>/dev/null", timeout=30)
+        result = self.ssh(f"{remote_path(self.python)} -c {shlex.quote(script)} 2>/dev/null", timeout=30)
         try:
             return json.loads((result.stdout or "").strip().splitlines()[-1])
         except (ValueError, IndexError):
@@ -87,13 +97,13 @@ class GpuApi:
         health = self._remote_health()
         if health:
             return health
-        assigns = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {"GPU_DIR": self.gpu_dir, "GPU_API_PORT": self.port,
+        assigns = " ".join(f"{k}={remote_path(v)}" for k, v in {"GPU_DIR": self.gpu_dir, "GPU_API_PORT": self.port,
                                                                     **({"GPU_API_TOKEN": self.token} if self.token else {}),
                                                                     **(env or {})}.items())
-        root = shlex.quote(self.gpu_dir)
+        root = remote_path(self.gpu_dir)
         # the subshell keeps ssh's stdout/stderr pipes from being inherited by the detached server
         start = (f"mkdir -p {root}/run && (cd {root} && env {assigns} nohup setsid nice -n 10 "
-                 f"{shlex.quote(self.python)} {root}/workers/server.py --port {self.port} "
+                 f"{remote_path(self.python)} {root}/workers/server.py --port {self.port} "
                  f">> {root}/run/server.log 2>&1 < /dev/null &) > /dev/null 2>&1 < /dev/null ; echo started")
         result = self.ssh(start)
         if result.returncode != 0:
@@ -108,7 +118,7 @@ class GpuApi:
 
     def stop_server(self) -> bool:
         """Ask the server to exit (SIGTERM) only if the pid file names a process called genjutsu-gpu-api."""
-        script = (f"p=$(python3 -c \"import json;print(json.load(open('{self.gpu_dir}/run/server.pid'))['pid'])\" 2>/dev/null); "
+        script = (f"p=$(python3 -c \"import json,os;print(json.load(open(os.path.expanduser('{self.gpu_dir}/run/server.pid')))['pid'])\" 2>/dev/null); "
                   f"[ -n \"$p\" ] && [ \"$(cat /proc/$p/comm 2>/dev/null)\" = {SERVER_NAME[:15]} ] && kill -TERM $p && echo stopped")
         return "stopped" in (self.ssh(script).stdout or "")
 

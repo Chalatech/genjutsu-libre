@@ -1,134 +1,127 @@
-import json, tempfile, unittest
+import io, json, tempfile, unittest, zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image
 
 import gpu_backend, raw_masks
+from gpu_api import GpuApiError
 from gpu_backend import Gpu, GpuError, GpuMemoryError, GpuUnreachable
 
-MEM = 'MemAvailable:   {} kB\n'
+
+class FakeApi:
+    """Stands in for GpuApi: records calls; 'downloads' write the canned outputs into the folder."""
+    def __init__(self, outputs=None, error=None):
+        self.outputs = outputs or {};self.error = error;self.calls = [];self.deleted = [];self.last_metrics = {'stages': {'infer': 1.5}}
+    def upload(self, path, name=None):
+        self.calls.append(('upload', Path(path).name, name));return 'f-in'
+    def predict(self, model, data, timeout=0, on_status=None):
+        self.calls.append(('predict', model, data, timeout))
+        if on_status:on_status('processing')
+        if self.error:raise self.error
+        return {n: 'f-'+n for n in self.outputs}
+    def download_all(self, output, folder):
+        self.calls.append(('download', sorted(output)))
+        for name in output:
+            target = Path(folder)/name;target.parent.mkdir(parents=True, exist_ok=True)
+            content = self.outputs[name]
+            if isinstance(content, dict):   # a folder (the real client unzips it)
+                for rel, data in content.items():(target/rel).parent.mkdir(parents=True, exist_ok=True);(target/rel).write_bytes(data)
+            else:target.write_bytes(content)
+        return {}
+    def delete(self, file_id):
+        self.deleted.append(file_id)
 
 
-def completed(code=0, out='', err=''):
-    return SimpleNamespace(returncode=code, stdout=out, stderr=err)
-
-
-class FakeProc:
-    def __init__(self, lines, code):
-        self.stdout = iter(lines);self.code = code
-    def wait(self):
-        return self.code
-
-
-class FakeHost:
-    """Stands in for ssh/rsync: records command lines; the 'host' is a local temp folder."""
-    def __init__(self, root, free_gb=64, code=0, lines=None):
-        self.root = Path(root);self.free_gb = free_gb;self.code = code;self.lines = lines;self.calls = [];self.popen_calls = []
-    def run(self, cmd, **kw):
-        self.calls.append(cmd)
-        if cmd[0] == 'rsync':
-            src, dst = cmd[-2], cmd[-1]
-            if ':' in dst:   # push: files... host:dir/
-                target = self.root/dst.split(':', 1)[1]
-                target.mkdir(parents=True, exist_ok=True)
-                for f in cmd[cmd.index('-e')+2:-1]:(target/Path(f).name).write_bytes(Path(f).read_bytes())
-            else:            # pull: host:dir/ local/
-                source = self.root/src.split(':', 1)[1]
-                import shutil;shutil.copytree(source, dst, dirs_exist_ok=True)
-            return completed()
-        text = cmd[-1]
-        if 'MemAvailable' in text:return completed(0, MEM.format(int(self.free_gb*1024*1024)))
-        if text.startswith('mkdir'):
-            for part in text.split()[2:]:(self.root/part.strip('"').replace('$HOME/', '').lstrip('/')).mkdir(parents=True, exist_ok=True)
-        return completed()
-    def popen(self, cmd, **kw):
-        self.popen_calls.append(cmd)
-        return FakeProc(self.lines if self.lines is not None else ['[separate] 10:00:00 demucs...\n', json.dumps({'worker': 'separate', 'exit': 0})+'\n'], self.code)
-
-
-def make_gpu(host, **kw):
-    return Gpu(host='gpuhost', directory='~/work', python='~/work/.venv/bin/python', status=lambda s: None, sleep=lambda s: None, **kw)
-
-
-class Patched(unittest.TestCase):
+class Stages(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        (self.root/'job'/'abc123').mkdir(parents=True)
-        self.folder = self.root/'job'/'abc123'
-    def host(self, **kw):
-        h = FakeHost(self.root/'remote', **kw)
-        for target, fn in (('subprocess.run', h.run), ('subprocess.Popen', h.popen)):
-            p = patch('gpu_backend.'+target, side_effect=fn);p.start();self.addCleanup(p.stop)
-        return h
+        self.folder = Path(self.tmp.name)/'abc123';self.folder.mkdir()
+        (self.folder/'original-audio.wav').write_bytes(b'wav');(self.folder/'original.mp4').write_bytes(b'mp4')
+    def gpu(self, **kw):
+        self.api = FakeApi(**kw);return Gpu(api=self.api, status=lambda s: None)
 
-
-class CommandLines(Patched):
-    def test_worker_command_line(self):
-        h = self.host();g = make_gpu(h)
-        summary = g.run('separate', 'abc123', ['--job-id', 'x y'], self.folder)
-        cmd = h.popen_calls[0]
-        self.assertEqual(cmd[:5], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'])
-        remote = cmd[-1]
-        for part in ('nice -n 10', 'timeout -k 30 900', 'workers/separate.py', '"$HOME"/work/jobs/abc123/in', '"$HOME"/work/jobs/abc123/out', "'x y'"):
-            self.assertIn(part, remote)
-        self.assertEqual(summary['exit'], 0)
-        self.assertIn('demucs', (self.folder/'gpu-logs'/'separate.log').read_text())
-
-    def test_stage_pushes_pulls_and_always_cleans(self):
-        h = self.host();g = make_gpu(h)
-        (self.folder/'original-audio.wav').write_bytes(b'wav')
-        out = h.root/'~/work/jobs/abc123/out'
-        with patch.object(Gpu, 'run', side_effect=lambda *a, **k: (out.mkdir(parents=True, exist_ok=True), (out/'report-separate.json').write_text('{}'), {'exit': 0})[2]):
-            g.stage('separate', self.folder, ['original-audio.wav'])
+    def test_separate_uploads_audio_downloads_stems_and_cleans(self):
+        gpu = self.gpu(outputs={'vocals.wav': b'v', 'music.wav': b'm', 'drums.wav': b'd', 'original-audio.wav': b'x',
+                                'audio-manifest.json': b'{"prediction_id": "abc123"}', 'report-separate.json': b'{}'})
+        gpu_backend.separate(self.folder, lambda s: None, gpu)
+        self.assertEqual(self.api.calls[0], ('upload', 'original-audio.wav', None))
+        self.assertEqual(self.api.calls[1][:3], ('predict', 'separate', {'audio': 'f-in', 'job_id': 'abc123'}))
+        for n in ('vocals.wav', 'music.wav', 'drums.wav', 'audio-manifest.json'):self.assertTrue((self.folder/n).exists(), n)
+        self.assertEqual((self.folder/'original-audio.wav').read_bytes(), b'wav')   # the local one is not overwritten
+        self.assertFalse((self.folder/'gpu-out').exists())
         self.assertTrue((self.folder/'gpu-reports'/'report-separate.json').exists())
-        self.assertIn('rm -rf', h.calls[-1][-1]);self.assertIn('jobs/abc123', h.calls[-1][-1])
+        self.assertEqual(json.loads((self.folder/'gpu-reports'/'api-separate.json').read_text())['stages']['infer'], 1.5)
 
-    def test_cleanup_even_when_worker_fails(self):
-        h = self.host(code=1, lines=[json.dumps({'worker': 'depth', 'exit': 1, 'error': 'RuntimeError: boom'})+'\n']);g = make_gpu(h)
-        (self.folder/'original.mp4').write_bytes(b'v')
-        with self.assertRaises(GpuError) as ctx:g.stage('depth', self.folder, ['original.mp4'])
-        self.assertIn('boom', str(ctx.exception))
-        self.assertIn('rm -rf', h.calls[-1][-1])
+    def test_depth_keeps_file_name(self):
+        gpu = self.gpu(outputs={'depth-raw.mp4': b'depth'})
+        gpu_backend.depth(self.folder, lambda s: None, gpu)
+        self.assertEqual((self.folder/'depth-raw.mp4').read_bytes(), b'depth')
+        self.assertEqual(self.api.calls[1][2], {'video': 'f-in'})
 
-    def test_unsafe_job_names_rejected(self):
-        g = make_gpu(self.host())
-        for bad in ('../x', 'a b', '', 'a;rm'):
-            with self.assertRaises(ValueError):g.job_dir(bad)
+    def test_segment_extracts_instances_and_listing(self):
+        listing = json.dumps({'instances': [{'id': 1}]}).encode()
+        gpu = self.gpu(outputs={'instances': {'1/mask_00000.png': b'png'}, 'instances.json': listing, 'instances-contact.jpg': b'jpg'})
+        (self.folder/'instances').mkdir();(self.folder/'instances'/'stale').write_bytes(b'old')
+        result = gpu_backend.segment(self.folder/'original.mp4', self.folder, 'person', lambda s: None, gpu)
+        self.assertEqual(result['instances'][0]['id'], 1)
+        self.assertTrue((self.folder/'instances'/'1'/'mask_00000.png').exists());self.assertFalse((self.folder/'instances'/'stale').exists())
+        self.assertEqual(self.api.calls[0], ('upload', 'original.mp4', 'original.mp4'))
+        self.assertEqual(self.api.calls[1][2], {'video': 'f-in', 'prompt': 'person'})
+
+    def test_missing_output_is_an_error(self):
+        gpu = self.gpu(outputs={'other.mp4': b'x'})
+        with self.assertRaisesRegex(GpuError, 'depth-raw.mp4 missing'):gpu_backend.depth(self.folder, lambda s: None, gpu)
+        self.assertFalse((self.folder/'gpu-out').exists())
+
+    def test_errors_are_translated_and_the_upload_is_deleted(self):
+        for code, kind in (('low_memory', GpuMemoryError), ('server_down', GpuUnreachable), ('worker_error', GpuError), ('timeout', GpuError)):
+            gpu = self.gpu(error=GpuApiError(code, 'boom'))
+            with self.assertRaises(kind) as ctx:gpu_backend.depth(self.folder, lambda s: None, gpu)
+            self.assertIn('boom', str(ctx.exception));self.assertEqual(self.api.deleted, ['f-in'])
+        self.assertNotIsInstance(ctx.exception, (GpuMemoryError, GpuUnreachable))
+
+    def test_failed_download_deletes_the_server_outputs(self):
+        gpu = self.gpu(outputs={'depth-raw.mp4': b'd'})
+        self.api.download_all = MagicMock(side_effect=GpuApiError('http_404', 'gone'))
+        with self.assertRaises(GpuError):gpu_backend.depth(self.folder, lambda s: None, gpu)
+        self.assertEqual(self.api.deleted, ['f-depth-raw.mp4'])
+
+    def test_timeout_includes_the_memory_wait(self):
+        with patch('gpu_backend.setting', return_value='30'):self.assertEqual(Gpu(api=FakeApi()).timeout('depth'), 1800+1800)
 
 
-class Failures(Patched):
-    def test_low_memory_rejected_without_running_anything(self):
-        h = self.host(free_gb=3);g = make_gpu(h)
-        ticks = iter(range(0, 100000, 130))
-        g.clock = lambda: next(ticks)
-        with patch.dict('os.environ', {'GPU_MEM_WAIT_MIN': '10', 'GPU_MEM_POLL_S': '120', 'GPU_MIN_FREE_GB': '20'}):
-            with self.assertRaises(GpuMemoryError) as ctx:g.run('segment', 'abc123')
-        self.assertIn('3.0 GB', str(ctx.exception).replace('3 GB', '3.0 GB'))
-        self.assertEqual(h.popen_calls, [])
+class Session(unittest.TestCase):
+    def fake_gpu(self):
+        api = MagicMock();api.tunnel.return_value.__enter__ = MagicMock();api.tunnel.return_value.__exit__ = MagicMock(return_value=False)
+        return Gpu(api=api, status=lambda s: None), api
 
-    def test_memory_recovers_while_waiting(self):
-        h = self.host(free_gb=3);g = make_gpu(h)
-        def sleeper(s):h.free_gb = 40
-        g.sleep = sleeper
-        with patch.dict('os.environ', {'GPU_MEM_WAIT_MIN': '10', 'GPU_MEM_POLL_S': '120'}):
-            g.run('separate', 'abc123')
-        self.assertEqual(len(h.popen_calls), 1)
+    def test_one_server_check_and_one_tunnel_for_nested_stages(self):
+        gpu, api = self.fake_gpu()
+        with patch('gpu_backend.Gpu', return_value=gpu), patch('gpu_backend.server_env', return_value={'GPU_MEM_WAIT_MIN': '5'}):
+            with gpu_backend.session(lambda s: None) as a, gpu_backend.session(lambda s: None) as b:
+                self.assertIs(a, b)
+            api.ensure_server.assert_called_once_with(env={'GPU_MEM_WAIT_MIN': '5'})
+            api.tunnel.assert_called_once()
+            api.tunnel.return_value.__exit__.assert_called_once()
+            with gpu_backend.session(lambda s: None):pass   # a later job opens its own
+            self.assertEqual(api.tunnel.call_count, 2)
 
-    def test_exit_codes(self):
-        cases = {3: GpuMemoryError, 255: GpuUnreachable, 124: GpuError, 1: GpuError}
-        for code, exc in cases.items():
-            g = make_gpu(self.host(code=code, lines=['oops\n']))
-            with self.assertRaises(exc):g.run('depth', 'abc123')
-        g = make_gpu(self.host(code=124, lines=[]))
-        with self.assertRaisesRegex(GpuError, 'limit'):g.run('depth', 'abc123')
+    def test_server_failure_is_translated_and_leaves_no_session(self):
+        gpu, api = self.fake_gpu();api.ensure_server.side_effect = GpuApiError('server_down', 'no start')
+        with patch('gpu_backend.Gpu', return_value=gpu):
+            with self.assertRaises(GpuUnreachable):
+                with gpu_backend.session(lambda s: None):pass
+        self.assertEqual(gpu_backend._state['users'], 0)
 
-    def test_unreachable_ssh(self):
-        with patch('gpu_backend.subprocess.run', return_value=completed(255, '', 'ssh: Could not resolve hostname\n')):
-            with self.assertRaises(GpuUnreachable):make_gpu(None).free_gb()
+    def test_pipeline_run_opens_the_session_only_for_gpu(self):
+        import pipeline
+        with patch('pipeline._run', return_value='ok') as inner, patch('gpu_backend.session') as sess, patch('gpu_backend.setting', return_value='replicate'):
+            pipeline.run('a', 'b', provider='replicate');sess.assert_not_called()
+            pipeline.run('a', 'b', provider='gpu');sess.assert_called_once()
+            self.assertEqual(inner.call_count, 2)
 
 
 class Routing(unittest.TestCase):
@@ -138,13 +131,18 @@ class Routing(unittest.TestCase):
         with patch('gpu_backend.setting', return_value='replicate'):
             self.assertFalse(gpu_backend.enabled());self.assertTrue(gpu_backend.enabled('gpu'))
 
-    def test_remote_path_keeps_home_expandable(self):
-        self.assertEqual(gpu_backend.remote_path('~/a b'), '"$HOME"/\'a b\'')
-        self.assertEqual(gpu_backend.remote_path('/srv/x'), '/srv/x')
-
     def test_requires_configuration(self):
         with patch('gpu_backend.setting', return_value=''):
             with self.assertRaises(ValueError):Gpu()
+
+    def test_server_env_only_passes_configured_limits(self):
+        values = {'GPU_MEM_WAIT_MIN': '5', 'GPU_API_TTL_MIN': '30'}
+        with patch('gpu_backend.setting', side_effect=lambda k, d='': values.get(k, d)):
+            self.assertEqual(gpu_backend.server_env(), values)
+
+    def test_no_rsync_transport_left(self):
+        for module in ('gpu_backend', 'gpu_api', 'doctor', 'pipeline', 'raw_masks', 'audio_workflow'):
+            self.assertNotIn('rsync', (Path(__file__).parent.parent/f'{module}.py').read_text(), module)
 
     def test_replicate_path_does_not_touch_gpu_backend(self):
         import audio_workflow
@@ -207,18 +205,28 @@ class Instances(unittest.TestCase):
 
 
 class Doctor(unittest.TestCase):
-    def check(self, code, out='', setting_value=None):
+    def check(self, ssh_code=0, health=None, ensure_error=None, tunnel_error=None):
         import doctor
         values = {'GPU_HOST': 'h', 'GPU_DIR': '~/d', 'GPU_PYTHON': ''}
-        with patch('doctor.setting', side_effect=lambda k, d='': values.get(k, d)), patch('subprocess.run', return_value=completed(code, out)):
-            return doctor.gpu_checks()[0]
+        api = MagicMock();api.ssh.return_value = SimpleNamespace(returncode=ssh_code, stdout='', stderr='')
+        api.health.return_value = health or {'memory_available_gb': 40, 'models_loaded': []}
+        if ensure_error:api.ensure_server.side_effect = ensure_error
+        if tunnel_error:api.tunnel.side_effect = tunnel_error
+        with patch('doctor.setting', side_effect=lambda k, d='': values.get(k, d)), patch('gpu_backend.setting', side_effect=lambda k, d='': values.get(k, d)), \
+                patch('gpu_api.GpuApi.from_env', return_value=api):
+            return doctor.gpu_checks()[0], api
 
     def test_ready(self):
-        c = self.check(0, json.dumps({'gpu': 'GB10', 'memory_available_gb': 40}));self.assertTrue(c.ok);self.assertNotIn('/', c.message.replace('GPU host:', ''))
+        c, api = self.check();self.assertTrue(c.ok);api.ensure_server.assert_called_once();api.health.assert_called_once()
+        self.assertNotIn('~', c.message)
     def test_low_memory_is_not_fatal(self):
-        c = self.check(3, json.dumps({'memory_available_gb': 5, 'min_free_gb': 20}));self.assertFalse(c.ok);self.assertFalse(c.fatal)
+        c, _ = self.check(health={'memory_available_gb': 5, 'models_loaded': []});self.assertFalse(c.ok);self.assertFalse(c.fatal)
     def test_unreachable_is_fatal(self):
-        c = self.check(255);self.assertTrue(c.fatal)
+        c, api = self.check(ssh_code=255);self.assertTrue(c.fatal);api.ensure_server.assert_not_called()
+    def test_server_that_will_not_start_is_fatal(self):
+        c, _ = self.check(ensure_error=GpuApiError('server_down', 'no health'));self.assertTrue(c.fatal);self.assertIn('server_down', c.message)
+    def test_tunnel_failure_is_fatal(self):
+        c, _ = self.check(tunnel_error=GpuApiError('server_down', 'tunnel exited'));self.assertTrue(c.fatal)
     def test_no_replicate_token_needed(self):
         import doctor
         with patch('doctor.setting', side_effect=lambda k, d='': 'gpu' if k == 'PREP_BACKEND' else ''), patch('doctor.gpu_checks', return_value=[]):
