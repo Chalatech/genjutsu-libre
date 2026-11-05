@@ -194,7 +194,7 @@ class ClientSsh(unittest.TestCase):
         start = run.call_args_list[1].args[0]
         self.assertEqual(start[:5], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'])
         text = start[-1]
-        for part in ('nohup setsid nice -n 10', 'workers/server.py --port 18770', 'GPU_API_EXIT_IDLE_MIN=1', 'GPU_API_TOKEN=t0k', '< /dev/null &'):
+        for part in ('nohup setsid nice -n 10', 'workers/server.py --port 18770', 'GPU_API_EXIT_IDLE_MIN=1', 'GPU_API_TOKEN=t0k', '< /dev/null &) > /dev/null 2>&1 < /dev/null ; echo started'):
             self.assertIn(part, text)
 
     def test_ensure_server_fails_clearly(self):

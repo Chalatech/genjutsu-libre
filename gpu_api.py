@@ -91,9 +91,10 @@ class GpuApi:
                                                                     **({"GPU_API_TOKEN": self.token} if self.token else {}),
                                                                     **(env or {})}.items())
         root = shlex.quote(self.gpu_dir)
-        start = (f"mkdir -p {root}/run && cd {root} && env {assigns} nohup setsid nice -n 10 "
+        # the subshell keeps ssh's stdout/stderr pipes from being inherited by the detached server
+        start = (f"mkdir -p {root}/run && (cd {root} && env {assigns} nohup setsid nice -n 10 "
                  f"{shlex.quote(self.python)} {root}/workers/server.py --port {self.port} "
-                 f">> {root}/run/server.log 2>&1 < /dev/null & echo started")
+                 f">> {root}/run/server.log 2>&1 < /dev/null &) > /dev/null 2>&1 < /dev/null ; echo started")
         result = self.ssh(start)
         if result.returncode != 0:
             raise GpuApiError("server_down", f"could not start the server: {(result.stderr or '').strip()[-300:]}")
