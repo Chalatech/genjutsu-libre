@@ -84,10 +84,28 @@ def finish_preview(generated,folder):
             if p.dts is not None:p.stream=astream;out.mux(p)
     return target
 
+def embed_vocals():
+    """SEEDANCE_EMBED_VOCALS (default true): embed pitched isolated vocals in the Seedance input."""
+    from config import setting
+    return str(setting('SEEDANCE_EMBED_VOCALS','true')).strip().lower() not in ('0','false','no','off')
+
 def prepare_seedance_video(folder, semitones=3):
-    """Embed +3-semitone isolated vocals into the colored-depth composite."""
+    """Embed +3-semitone isolated vocals into the colored-depth composite.
+
+    With SEEDANCE_EMBED_VOCALS=false the Seedance input is the silent composite: no source vocals
+    leave the machine (providers may reject recognisable or copyrighted voices, and lip-sync guidance
+    is not needed when the final export restores the original soundtrack anyway)."""
     import subprocess,shutil
-    folder=Path(folder);binary=shutil.which('rubberband')
+    folder=Path(folder)
+    if not embed_vocals():
+        target=folder/'seedance-input.mp4'
+        shutil.copyfile(folder/'composite-silent.mp4',target)
+        manifest=folder/'audio-manifest.json'
+        data=json.loads(manifest.read_text()) if manifest.exists() else {}
+        data.update(seedance_video='seedance-input.mp4',seedance_audio=None,pitch_semitones=None,embedded_vocals=None)
+        manifest.write_text(json.dumps(data,indent=2))
+        return target
+    binary=shutil.which('rubberband')
     if not binary:raise RuntimeError('Rubber Band is required for pitch shifting.')
     pitched=folder/f'vocals-plus{semitones}.wav'
     subprocess.run([binary,'--fine','--pitch',str(semitones),'--time','1',str(folder/'vocals.wav'),str(pitched)],check=True,capture_output=True)

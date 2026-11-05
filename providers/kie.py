@@ -127,7 +127,9 @@ class KieProvider(GenerationProvider):
         refs = list(job.references)
         video_urls = [urls[0]] + [u for ref, u in zip(refs, urls[1:]) if Path(ref).suffix.lower() in VIDEO_SUFFIXES]
         image_urls = [u for ref, u in zip(refs, urls[1:]) if Path(ref).suffix.lower() in IMAGE_SUFFIXES]
-        notes = ['@Video1 is the source edit: a colored-depth composite with isolated vocals pitched +3 semitones embedded; use its embedded audio for performance and lip synchronization.']
+        from audio_workflow import embed_vocals
+        notes = ['@Video1 is the source edit: a colored-depth composite with isolated vocals pitched +3 semitones embedded; use its embedded audio for performance and lip synchronization.'
+                 if embed_vocals() else '@Video1 is the source edit: a silent colored-depth composite; follow its motion and timing.']
         n_video = 1
         for ref in refs:
             if Path(ref).suffix.lower() in VIDEO_SUFFIXES:

@@ -37,3 +37,18 @@ class MediaTests(unittest.TestCase):
     for i in range(2):put(c,s,np.zeros((64,64,3),dtype=np.uint8),i)
     finish(c,s)
    with self.assertRaisesRegex(ValueError,'Frame alignment'):composite(p/'original.mp4',p/'depth.mp4',p/'masks',p)
+
+
+class SilentSeedanceInputTest(unittest.TestCase):
+    def test_no_vocals_copies_silent_composite(self):
+        import tempfile, os
+        from pathlib import Path
+        from unittest import mock
+        import audio_workflow
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {'SEEDANCE_EMBED_VOCALS': 'false'}):
+            d = Path(d); (d/'composite-silent.mp4').write_bytes(b'silent-video')
+            out = audio_workflow.prepare_seedance_video(d)
+            self.assertEqual(out.read_bytes(), b'silent-video')
+            import json
+            m = json.loads((d/'audio-manifest.json').read_text())
+            self.assertIsNone(m['embedded_vocals'])
